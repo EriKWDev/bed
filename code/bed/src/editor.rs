@@ -31,8 +31,8 @@ use crate::rust_methods::{
     rust_namespace_root, rust_symbol_detail, rust_symbol_name, rust_symbol_owner, rust_symbol_path,
 };
 use crate::syntax::{
-    SYNTAX_KIND_COUNT, SyntaxHighlighting, SyntaxKind, SyntaxSpan,
-    syntax_highlighting_adjust_edits, syntax_highlighting_empty, syntax_highlighting_invalidate,
+    SYNTAX_KIND_COUNT, SyntaxHighlighting, SyntaxKind, SyntaxSpan, syntax_highlighting_empty,
+    syntax_highlighting_invalidate, syntax_highlighting_invalidate_edits,
     syntax_highlighting_set_path, syntax_highlighting_spans, syntax_highlighting_step,
 };
 use crate::terminal::{self, Key, Terminal};
@@ -1561,8 +1561,7 @@ pub fn document_replace_ranges(
         ));
         line_edits.push((start_line, scan_line, inserted_lines));
     }
-    syntax_highlighting_invalidate(&mut document.syntax);
-    syntax_highlighting_adjust_edits(&mut document.syntax, &byte_edits);
+    syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
     code_index_invalidate(&mut document.code_index);
     git_gutter_invalidate(&mut document.git_gutter);
     git_gutter_adjust_edits(&mut document.git_gutter, &line_edits);

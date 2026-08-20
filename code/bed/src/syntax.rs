@@ -64,6 +64,7 @@ pub struct SyntaxHighlighting {
     pub language: SyntaxLanguage,
     pub spans: Vec<SyntaxSpan>,
     pub previous_spans: Vec<SyntaxSpan>,
+    pub checkpoints: Vec<SyntaxCheckpoint>,
     pub position: usize,
     pub token_start: usize,
     pub mode: SyntaxMode,
@@ -75,11 +76,24 @@ pub struct SyntaxHighlighting {
     pub complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntaxCheckpoint {
+    pub position: u32,
+    pub token_start: u32,
+    pub block_depth: u16,
+    pub mode: SyntaxMode,
+    pub delimiter: u8,
+    pub delimiter_length: u8,
+    pub escaped: bool,
+    pub line_start: bool,
+}
+
 pub fn syntax_highlighting_empty() -> SyntaxHighlighting {
     SyntaxHighlighting {
         language: SyntaxLanguage::None,
         spans: Vec::new(),
         previous_spans: Vec::new(),
+        checkpoints: Vec::new(),
         position: 0,
         token_start: 0,
         mode: SyntaxMode::Code,
@@ -138,6 +152,7 @@ pub fn syntax_highlighting_invalidate(highlighting: &mut SyntaxHighlighting) {
         language,
         spans,
         previous_spans,
+        checkpoints,
         position,
         token_start,
         mode,
@@ -161,6 +176,17 @@ pub fn syntax_highlighting_invalidate(highlighting: &mut SyntaxHighlighting) {
     *escaped = false;
     *line_start = true;
     *complete = *language == SyntaxLanguage::None;
+    checkpoints.clear();
+    checkpoints.push(SyntaxCheckpoint {
+        position: 0,
+        token_start: 0,
+        block_depth: 0,
+        mode: SyntaxMode::Code,
+        delimiter: 0,
+        delimiter_length: 1,
+        escaped: false,
+        line_start: true,
+    });
 }
 
 pub fn syntax_highlighting_step(
@@ -188,6 +214,7 @@ pub fn syntax_highlighting_step(
         if highlighting.position & 255 == 0 && started.elapsed() >= maximum_time {
             break;
         }
+        let previous_position = highlighting.position;
         match highlighting.mode {
             SyntaxMode::Code => syntax_scan_code_byte(buffer, highlighting, length),
             SyntaxMode::Identifier => syntax_scan_identifier_byte(buffer, highlighting, length),
@@ -203,6 +230,11 @@ pub fn syntax_highlighting_step(
             SyntaxMode::MarkupDelimited => syntax_scan_markup_delimited_byte(buffer, highlighting),
             SyntaxMode::MarkdownFence => syntax_scan_markdown_fence_byte(buffer, highlighting),
         }
+        if highlighting.position > previous_position
+            && buffer_byte(buffer, highlighting.position - 1) == b'\n'
+        {
+            syntax_checkpoint_push(highlighting);
+        }
     }
 
     if highlighting.position >= length {
@@ -214,6 +246,83 @@ pub fn syntax_highlighting_step(
     !retained_previous
         && (highlighting.position != original_position
             || highlighting.spans.len() != original_span_count)
+}
+
+pub fn syntax_highlighting_invalidate_edits(
+    highlighting: &mut SyntaxHighlighting,
+    edits: &[(usize, usize, usize)],
+) {
+    profiling::function_scope!();
+    if edits.is_empty() {
+        return;
+    }
+    if highlighting.previous_spans.is_empty() && !highlighting.spans.is_empty() {
+        std::mem::swap(&mut highlighting.spans, &mut highlighting.previous_spans);
+    }
+    syntax_highlighting_adjust_edits(highlighting, edits);
+
+    let first_edit = edits.iter().map(|&(start, _, _)| start).min().unwrap_or(0);
+    let checkpoint_index = highlighting
+        .checkpoints
+        .partition_point(|checkpoint| checkpoint.position as usize <= first_edit)
+        .saturating_sub(1);
+    let checkpoint = highlighting
+        .checkpoints
+        .get(checkpoint_index)
+        .copied()
+        .unwrap_or(SyntaxCheckpoint {
+            position: 0,
+            token_start: 0,
+            block_depth: 0,
+            mode: SyntaxMode::Code,
+            delimiter: 0,
+            delimiter_length: 1,
+            escaped: false,
+            line_start: true,
+        });
+    let restart = checkpoint.position as usize;
+    highlighting
+        .spans
+        .retain(|span| span.end as usize <= restart);
+    if highlighting.spans.is_empty() && restart > 0 {
+        highlighting.spans.extend(
+            highlighting
+                .previous_spans
+                .iter()
+                .copied()
+                .take_while(|span| span.end as usize <= restart),
+        );
+    }
+    highlighting.checkpoints.truncate(checkpoint_index + 1);
+    highlighting.position = restart;
+    highlighting.token_start = checkpoint.token_start as usize;
+    highlighting.block_depth = checkpoint.block_depth;
+    highlighting.mode = checkpoint.mode;
+    highlighting.delimiter = checkpoint.delimiter;
+    highlighting.delimiter_length = checkpoint.delimiter_length;
+    highlighting.escaped = checkpoint.escaped;
+    highlighting.line_start = checkpoint.line_start;
+    highlighting.complete = highlighting.language == SyntaxLanguage::None;
+}
+
+fn syntax_checkpoint_push(highlighting: &mut SyntaxHighlighting) {
+    let checkpoint = SyntaxCheckpoint {
+        position: highlighting.position as u32,
+        token_start: highlighting.token_start as u32,
+        block_depth: highlighting.block_depth,
+        mode: highlighting.mode,
+        delimiter: highlighting.delimiter,
+        delimiter_length: highlighting.delimiter_length,
+        escaped: highlighting.escaped,
+        line_start: highlighting.line_start,
+    };
+    if highlighting
+        .checkpoints
+        .last()
+        .is_none_or(|previous| previous.position < checkpoint.position)
+    {
+        highlighting.checkpoints.push(checkpoint);
+    }
 }
 
 pub fn syntax_highlighting_spans(highlighting: &SyntaxHighlighting) -> &[SyntaxSpan] {
@@ -1438,7 +1547,7 @@ fn syntax_range_equal(buffer: &GapBuffer, start: usize, end: usize, expected: &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::buffer_from_bytes;
+    use crate::buffer::{buffer_from_bytes, buffer_insert};
 
     fn highlight(path: &str, source: &str) -> SyntaxHighlighting {
         let buffer = buffer_from_bytes(source.as_bytes());
@@ -1637,6 +1746,28 @@ mod tests {
         );
         assert!(highlighting.complete);
         assert!(highlighting.previous_spans.is_empty());
+    }
+
+    #[test]
+    fn edit_invalidation_resumes_from_the_nearest_lexer_checkpoint() {
+        let original = "fn first() {\n    let text = \"one\";\n}\nfn second() {\n    return;\n}\n";
+        let mut buffer = buffer_from_bytes(original.as_bytes());
+        let mut highlighting = highlight("main.rs", original);
+        let edit = original.find("return").unwrap();
+        let restart = original[..edit].rfind('\n').unwrap() + 1;
+        syntax_highlighting_invalidate_edits(&mut highlighting, &[(edit, edit, 4)]);
+        buffer_insert(&mut buffer, edit, b"loop");
+
+        assert_eq!(highlighting.position, restart);
+        assert!(highlighting.position > 0);
+        assert!(!highlighting.spans.is_empty());
+        while !highlighting.complete {
+            syntax_highlighting_step(&buffer, &mut highlighting, 16, std::time::Duration::MAX);
+        }
+
+        let edited = original.replacen("return", "loopreturn", 1);
+        let rebuilt = highlight("main.rs", &edited);
+        assert_eq!(highlighting.spans, rebuilt.spans);
     }
 
     #[test]
