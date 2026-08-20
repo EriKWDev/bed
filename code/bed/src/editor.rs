@@ -460,6 +460,7 @@ pub struct ReferenceDefinition {
 pub struct SearchLine {
     pub project_file: u32,
     pub file_offset: u32,
+    pub line_number: u32,
     pub text_start: u32,
     pub display_start: u32,
     pub display_end: u32,
@@ -2711,6 +2712,7 @@ fn search_corpus_index_document(document: &Document, corpus: &mut SearchCorpus) 
         corpus.lines.push(SearchLine {
             project_file: u32::MAX,
             file_offset: start as u32,
+            line_number,
             text_start: text_start as u32,
             display_start: display_start as u32,
             display_end: text_end as u32,
@@ -2877,8 +2879,7 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
                 .position(|&byte| byte == b'\n')
                 .map_or(source.len(), |offset| start + offset);
             let display_start = corpus.bytes.len();
-            write!(&mut corpus.bytes, "{label}:{line_number}: ").unwrap();
-            let text_start = corpus.bytes.len();
+            let text_start = display_start;
             corpus.bytes.extend_from_slice(&source[start..end]);
             let text_end = corpus.bytes.len();
             if text_end > u32::MAX as usize
@@ -2891,6 +2892,7 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
             corpus.lines.push(SearchLine {
                 project_file: project_file as u32,
                 file_offset: start as u32,
+                line_number,
                 text_start: text_start as u32,
                 display_start: display_start as u32,
                 display_end: text_end as u32,
@@ -8300,6 +8302,7 @@ fn reference_target_push(
     picker.symbol_corpus.lines.push(SearchLine {
         project_file,
         file_offset: start as u32,
+        line_number: 0,
         text_start: label_start as u32,
         display_start: label_start as u32,
         display_end: label_end as u32,
@@ -9263,6 +9266,8 @@ fn editor_render_picker(
     profiling::function_scope!();
     let picker = editor.picker.as_ref().unwrap();
     let theme = &THEMES[editor.theme];
+    let temp = idno_std::mem().scratch().temp();
+    let mut label_storage = temp.vec(256);
     let title = match picker.kind {
         PickerKind::Files => "files",
         PickerKind::Commands => "commands",
@@ -9371,14 +9376,16 @@ fn editor_render_picker(
                     .frame
                     .extend_from_slice(diagnostic_severity_style(diagnostic.severity, theme));
             }
-            let label = picker_item_label(
+            picker_item_label(
                 &editor.project.labels,
                 editor.project_search.as_ref(),
                 &editor.rust_methods,
                 &editor.diagnostics,
                 picker,
                 item,
+                &mut label_storage,
             );
+            let label = std::str::from_utf8(&label_storage).unwrap_or("");
             let label_width = list_width.saturating_sub(2 + usize::from(scrollbar));
             append_terminal_text(label, label_width, &mut editor.frame);
             let rendered_label = terminal_text_width(label, label_width);
@@ -9461,60 +9468,66 @@ fn picker_item_at(editor: &Editor, picker: &Picker, position: usize) -> Option<u
     }
 }
 
-fn picker_item_label<'a>(
-    project_labels: &'a [String],
-    project_search: Option<&'a SearchCorpus>,
-    rust_methods: &'a RustMethodIndex,
-    diagnostics: &'a Diagnostics,
-    picker: &'a Picker,
+fn picker_item_label(
+    project_labels: &[String],
+    project_search: Option<&SearchCorpus>,
+    rust_methods: &RustMethodIndex,
+    diagnostics: &Diagnostics,
+    picker: &Picker,
     item: usize,
-) -> &'a str {
+    result: &mut Vec<u8, impl Allocator>,
+) {
+    profiling::function_scope!();
+    result.clear();
     match picker.kind {
-        PickerKind::Files => project_labels[item].as_str(),
+        PickerKind::Files => result.extend_from_slice(project_labels[item].as_bytes()),
         PickerKind::Commands => {
-            if command_theme_argument(&picker.query).is_some() {
+            let label = if command_theme_argument(&picker.query).is_some() {
                 THEME_NAMES[item]
             } else if command_file_argument(&picker.query).is_some() {
                 project_labels[item].as_str()
             } else {
                 COMMANDS[item]
-            }
+            };
+            result.extend_from_slice(label.as_bytes());
         }
         PickerKind::SearchProject => {
             let Some(corpus) = project_search else {
-                return "";
+                return;
             };
             let line = corpus.lines[item];
-            std::str::from_utf8(
-                &corpus.bytes[line.display_start as usize..line.display_end as usize],
-            )
-            .unwrap_or("")
+            let Some(label) = project_labels.get(line.project_file as usize) else {
+                return;
+            };
+            write!(result, "{label}:{}: ", line.line_number).unwrap();
+            result.extend_from_slice(
+                &corpus.bytes[line.text_start as usize..line.display_end as usize],
+            );
         }
         PickerKind::DocumentSymbols => {
             let line = picker.symbol_corpus.lines[picker.symbol_candidates[item]];
             let source =
                 &picker.symbol_corpus.bytes[line.text_start as usize..line.display_end as usize];
             let Some((start, end)) = rust_symbol_name_range(source) else {
-                return "";
+                return;
             };
-            std::str::from_utf8(&source[start..end]).unwrap_or("")
+            result.extend_from_slice(&source[start..end]);
         }
         PickerKind::WorkspaceSymbols => {
             let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
-                return "";
+                return;
             };
-            rust_symbol_name(&rust_methods.corpus, symbol)
+            result.extend_from_slice(rust_symbol_name(&rust_methods.corpus, symbol).as_bytes());
         }
         PickerKind::References => {
             let line = picker.symbol_corpus.lines[item];
-            std::str::from_utf8(
+            result.extend_from_slice(
                 &picker.symbol_corpus.bytes[line.display_start as usize..line.display_end as usize],
-            )
-            .unwrap_or("")
+            );
         }
         PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
             let diagnostic = picker.diagnostic_candidates[item];
-            diagnostics.published[diagnostic].display.as_str()
+            result.extend_from_slice(diagnostics.published[diagnostic].display.as_bytes());
         }
     }
 }
@@ -12168,6 +12181,7 @@ mod tests {
             lines: vec![SearchLine {
                 project_file: 0,
                 file_offset: 0,
+                line_number: 1,
                 text_start: 0,
                 display_start: 0,
                 display_end: source.len() as u32,
@@ -12268,6 +12282,7 @@ mod tests {
             lines: vec![SearchLine {
                 project_file: 0,
                 file_offset: 0,
+                line_number: 1,
                 text_start: 0,
                 display_start: 0,
                 display_end: source.len() as u32,
@@ -12496,6 +12511,7 @@ mod tests {
             corpus.lines.push(SearchLine {
                 project_file: 0,
                 file_offset: 0,
+                line_number: item + 1,
                 text_start: start as u32,
                 display_start: start as u32,
                 display_end: end as u32,
