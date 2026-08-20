@@ -32,8 +32,8 @@ use crate::rust_methods::{
 };
 use crate::syntax::{
     SYNTAX_KIND_COUNT, SyntaxHighlighting, SyntaxKind, SyntaxSpan, syntax_highlighting_empty,
-    syntax_highlighting_invalidate, syntax_highlighting_invalidate_edits,
-    syntax_highlighting_set_path, syntax_highlighting_spans, syntax_highlighting_step,
+    syntax_highlighting_invalidate_edits, syntax_highlighting_set_path, syntax_highlighting_spans,
+    syntax_highlighting_step,
 };
 use crate::terminal::{self, Key, Terminal};
 
@@ -1435,22 +1435,32 @@ pub fn document_undo(document: &mut Document) {
     let Some(transaction) = document.undo.pop() else {
         return;
     };
-    syntax_highlighting_invalidate(&mut document.syntax);
     code_index_invalidate(&mut document.code_index);
     git_gutter_invalidate(&mut document.git_gutter);
     for edit in transaction.edits.iter().rev() {
-        for atom in edit.atoms.iter().rev() {
-            buffer_delete(
-                &mut document.buffer,
+        let temp = idno_std::mem().scratch().temp();
+        let mut byte_edits = temp.vec(edit.atoms.len());
+        let mut replacements = temp.vec(edit.atoms.len());
+        for atom in &edit.atoms {
+            byte_edits.push((
                 atom.after_start,
                 atom.after_start + atom.inserted.len(),
-            );
-            buffer_insert(
-                &mut document.buffer,
+                atom.deleted.len(),
+            ));
+            replacements.push((
                 atom.after_start,
-                &edit.deleted_bytes[atom.deleted.clone()],
-            );
+                atom.after_start + atom.inserted.len(),
+                atom.deleted.clone(),
+            ));
         }
+        syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
+        let mut previous_line_starts = temp.vec(document.buffer.line_starts.len());
+        buffer_replace_ranges(
+            &mut document.buffer,
+            &replacements,
+            &edit.deleted_bytes,
+            &mut previous_line_starts,
+        );
         document_set_selections(document, &edit.before);
     }
     document.redo.push(transaction);
@@ -1462,22 +1472,32 @@ pub fn document_redo(document: &mut Document) {
     let Some(transaction) = document.redo.pop() else {
         return;
     };
-    syntax_highlighting_invalidate(&mut document.syntax);
     code_index_invalidate(&mut document.code_index);
     git_gutter_invalidate(&mut document.git_gutter);
     for edit in &transaction.edits {
-        for atom in edit.atoms.iter().rev() {
-            buffer_delete(
-                &mut document.buffer,
+        let temp = idno_std::mem().scratch().temp();
+        let mut byte_edits = temp.vec(edit.atoms.len());
+        let mut replacements = temp.vec(edit.atoms.len());
+        for atom in &edit.atoms {
+            byte_edits.push((
                 atom.before_start,
                 atom.before_start + atom.deleted.len(),
-            );
-            buffer_insert(
-                &mut document.buffer,
+                atom.inserted.len(),
+            ));
+            replacements.push((
                 atom.before_start,
-                &edit.inserted_bytes[atom.inserted.clone()],
-            );
+                atom.before_start + atom.deleted.len(),
+                atom.inserted.clone(),
+            ));
         }
+        syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
+        let mut previous_line_starts = temp.vec(document.buffer.line_starts.len());
+        buffer_replace_ranges(
+            &mut document.buffer,
+            &replacements,
+            &edit.inserted_bytes,
+            &mut previous_line_starts,
+        );
         document_set_selections(document, &edit.after);
     }
     document.undo.push(transaction);
