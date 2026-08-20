@@ -4,9 +4,29 @@ use std::io::Read as _;
 use std::io::Write as _;
 
 use crate::buffer::*;
+use crate::code_index::{
+    CodeIndex, code_index_definition_for, code_index_empty, code_index_identifier_at,
+    code_index_invalidate, code_index_set_path, code_index_step,
+};
 use crate::fuzzy::{FuzzyMatch, fuzzy_byte_matches, fuzzy_rank};
+use crate::git::{
+    GitGutter, git_gutter_adjust_edits, git_gutter_empty, git_gutter_flags, git_gutter_invalidate,
+    git_gutter_line_added, git_gutter_line_modified, git_gutter_line_removed,
+    git_gutter_next_change, git_gutter_pending, git_gutter_poll, git_gutter_set_path,
+    git_gutter_step,
+};
 use crate::project::{
     ProjectDiscoveryState, ProjectFiles, project_discover, project_discovery_step,
+};
+use crate::rust_methods::{
+    RustMethodIndex, rust_method_complete, rust_method_definition, rust_method_index_empty,
+    rust_method_index_pending, rust_method_index_poll, rust_method_index_start, rust_method_name,
+    rust_method_path, rust_symbol_name, rust_symbol_path,
+};
+use crate::syntax::{
+    SYNTAX_KIND_COUNT, SyntaxHighlighting, syntax_highlighting_adjust_edits,
+    syntax_highlighting_empty, syntax_highlighting_invalidate, syntax_highlighting_set_path,
+    syntax_highlighting_spans, syntax_highlighting_step,
 };
 use crate::terminal::{self, Key, Terminal};
 
@@ -51,6 +71,9 @@ pub struct EditTransaction {
 
 pub struct Document {
     pub buffer: GapBuffer,
+    pub syntax: SyntaxHighlighting,
+    pub code_index: CodeIndex,
+    pub git_gutter: GitGutter,
     pub path: Option<std::path::PathBuf>,
     pub cursor: usize,
     pub anchor: usize,
@@ -69,6 +92,9 @@ pub enum PickerKind {
     Files,
     Commands,
     SearchProject,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    References,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,12 +106,165 @@ pub enum PendingKey {
     Match,
     MatchAround,
     MatchInside,
+    InsertLineAbove,
+    InsertLineBelow,
+}
+
+#[derive(Clone, Copy)]
+pub struct KeyHint {
+    pub key: &'static str,
+    pub description: &'static str,
+}
+
+const SPACE_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "/",
+        description: "global search",
+    },
+    KeyHint {
+        key: "f",
+        description: "file picker",
+    },
+    KeyHint {
+        key: "t",
+        description: "theme",
+    },
+    KeyHint {
+        key: "s",
+        description: "document symbols",
+    },
+    KeyHint {
+        key: "S",
+        description: "workspace symbols",
+    },
+    KeyHint {
+        key: "Y",
+        description: "yank to clipboard",
+    },
+    KeyHint {
+        key: "P",
+        description: "paste clipboard after",
+    },
+];
+const THEME_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "d/k",
+        description: "kanagawa",
+    },
+    KeyHint {
+        key: "b",
+        description: "bogster",
+    },
+    KeyHint {
+        key: "l",
+        description: "everforest light",
+    },
+    KeyHint {
+        key: "n",
+        description: "noctis",
+    },
+    KeyHint {
+        key: "v",
+        description: "kaolin valley dark",
+    },
+];
+const GOTO_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "g",
+        description: "file start",
+    },
+    KeyHint {
+        key: "e",
+        description: "last line",
+    },
+    KeyHint {
+        key: "h",
+        description: "line start",
+    },
+    KeyHint {
+        key: "l",
+        description: "line end",
+    },
+    KeyHint {
+        key: "s",
+        description: "first non-whitespace",
+    },
+    KeyHint {
+        key: "a",
+        description: "last accessed buffer",
+    },
+    KeyHint {
+        key: "n/p",
+        description: "next/previous buffer",
+    },
+    KeyHint {
+        key: "j/k",
+        description: "line down/up",
+    },
+    KeyHint {
+        key: "t/c/b",
+        description: "window top/center/bottom",
+    },
+    KeyHint {
+        key: "d",
+        description: "definition",
+    },
+    KeyHint {
+        key: "r",
+        description: "references",
+    },
+];
+const MATCH_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "a",
+        description: "select around",
+    },
+    KeyHint {
+        key: "i",
+        description: "select inside",
+    },
+];
+const MATCH_AROUND_KEY_HINTS: &[KeyHint] = &[KeyHint {
+    key: "f/<char>",
+    description: "select around delimiter",
+}];
+const MATCH_INSIDE_KEY_HINTS: &[KeyHint] = &[KeyHint {
+    key: "f/<char>",
+    description: "select inside delimiter",
+}];
+const INSERT_LINE_KEY_HINTS: &[KeyHint] = &[
+    KeyHint {
+        key: "Space",
+        description: "insert blank line",
+    },
+    KeyHint {
+        key: "g",
+        description: "Git change",
+    },
+    KeyHint {
+        key: "f",
+        description: "function",
+    },
+];
+
+pub fn pending_key_hints(pending: PendingKey) -> &'static [KeyHint] {
+    match pending {
+        PendingKey::None => &[],
+        PendingKey::Space => SPACE_KEY_HINTS,
+        PendingKey::SpaceTheme => THEME_KEY_HINTS,
+        PendingKey::Goto => GOTO_KEY_HINTS,
+        PendingKey::Match => MATCH_KEY_HINTS,
+        PendingKey::MatchAround => MATCH_AROUND_KEY_HINTS,
+        PendingKey::MatchInside => MATCH_INSIDE_KEY_HINTS,
+        PendingKey::InsertLineAbove | PendingKey::InsertLineBelow => INSERT_LINE_KEY_HINTS,
+    }
 }
 
 bitfield::bitfield! {
     pub struct EditorFlags: 1 {
         const AUTO_INDENTATION = 0;
         const AUTO_INDENT_SCOPES = 1;
+        const AUTO_PAIRS = 2;
     }
 }
 
@@ -93,6 +272,22 @@ pub struct EditorConfig {
     pub flags: EditorFlags,
     pub indentation_spaces: usize,
     pub scroll_margin_lines: usize,
+}
+
+pub struct Completion {
+    pub matches: Vec<FuzzyMatch>,
+    pub selected: usize,
+    pub prefix_start: usize,
+}
+
+pub struct Register {
+    pub bytes: Vec<u8>,
+    pub values: Vec<std::ops::Range<u32>>,
+}
+
+pub struct ClipboardPaste {
+    pub bytes: Vec<u8>,
+    pub available: bool,
 }
 
 pub struct Picker {
@@ -107,6 +302,17 @@ pub struct Picker {
     pub search_complete: bool,
     pub search_seen: Vec<u64>,
     pub search_ranked: Vec<FuzzyMatch>,
+    pub symbol_corpus: SearchCorpus,
+    pub symbol_candidates: Vec<usize>,
+    pub rust_symbol_candidates: Vec<usize>,
+    pub reference_targets: Vec<ReferenceTarget>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ReferenceTarget {
+    pub project_file: u32,
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -153,15 +359,23 @@ pub struct Editor {
     pub mode: Mode,
     pub picker: Option<Picker>,
     pub pending_key: PendingKey,
+    pub pending_count: usize,
     pub last_accessed_document: Option<usize>,
     pub config: EditorConfig,
     pub viewport_height: usize,
+    pub terminal_width: usize,
+    pub terminal_height: usize,
     pub jumps: Vec<Jump>,
     pub jump_position: usize,
     pub quit_warning: bool,
     pub quit_requested: bool,
     pub status: String,
     pub frame: Vec<u8>,
+    pub present_frame: Vec<u8>,
+    pub rendered_row_hashes: Vec<u64>,
+    pub rendered_theme: usize,
+    pub rendered_picker: bool,
+    pub rendered_overlay_start: Option<usize>,
     pub theme: usize,
     pub search_query: String,
     pub search_matches: Vec<SelectionState>,
@@ -170,9 +384,14 @@ pub struct Editor {
     pub project_search: Option<SearchCorpus>,
     pub project_search_task: Option<idno_std::micropool::OwnedTask<SearchCorpus>>,
     pub project_discovery: Option<ProjectDiscoveryState>,
+    pub rust_methods: RustMethodIndex,
+    pub completion: Option<Completion>,
+    pub register: Register,
+    pub clipboard_copy_task: Option<idno_std::micropool::OwnedTask<bool>>,
+    pub clipboard_paste_task: Option<idno_std::micropool::OwnedTask<ClipboardPaste>>,
 }
 
-const COMMANDS: [&str; 57] = [
+const COMMANDS: [&str; 66] = [
     "write",
     "w",
     "write!",
@@ -228,8 +447,17 @@ const COMMANDS: [&str; 57] = [
     "theme",
     "t",
     "reload-files",
+    "reload",
+    "reload!",
+    "rl",
+    "rl!",
+    "reload-all",
+    "reload-all!",
+    "rla",
+    "rla!",
     "toggle-auto-indentation",
     "toggle-auto-indent-scopes",
+    "toggle-auto-pairs",
 ];
 
 pub struct Theme {
@@ -240,6 +468,10 @@ pub struct Theme {
     pub search_scope: &'static [u8],
     pub selection: &'static [u8],
     pub cursor: &'static [u8],
+    pub syntax: [&'static [u8]; SYNTAX_KIND_COUNT],
+    pub git_added: &'static [u8],
+    pub git_modified: &'static [u8],
+    pub git_removed: &'static [u8],
     pub picker_selected: &'static [u8],
     pub cursor_color: &'static [u8],
 }
@@ -261,6 +493,29 @@ const THEMES: [Theme; 5] = [
         search_scope: b"\x1b[38;2;190;186;164m\x1b[48;2;38;39;50m",
         selection: b"\x1b[38;2;220;215;186m\x1b[48;2;45;79;103m",
         cursor: b"\x1b[38;2;31;31;40m\x1b[48;2;200;192;147m",
+        syntax: [
+            b"\x1b[38;2;114;113;105m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;228;104;118m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;152;187;108m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;255;160;102m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;122;168;159m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;126;156;216m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;230;195;132m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;149;127;184m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;255;160;102m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;149;127;184m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;228;104;118m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;230;195;132m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;200;192;147m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;147;146;134m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;230;195;132m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;126;156;216m\x1b[48;2;31;31;40m",
+            b"\x1b[38;2;255;160;102m\x1b[48;2;31;31;40m",
+            b"\x1b[1;38;2;255;70;85m\x1b[48;2;31;31;40m",
+        ],
+        git_added: b"\x1b[38;2;152;187;108m\x1b[48;2;31;31;40m",
+        git_modified: b"\x1b[38;2;255;160;102m\x1b[48;2;31;31;40m",
+        git_removed: b"\x1b[38;2;228;104;118m\x1b[48;2;31;31;40m",
         picker_selected: b"\x1b[38;2;31;31;40m\x1b[48;2;126;156;216m",
         cursor_color: b"\x1b]12;#c8c093\x07",
     },
@@ -272,6 +527,29 @@ const THEMES: [Theme; 5] = [
         search_scope: b"\x1b[38;2;190;190;190m\x1b[48;2;31;31;36m",
         selection: b"\x1b[38;2;240;240;240m\x1b[48;2;62;62;78m",
         cursor: b"\x1b[38;2;18;18;18m\x1b[48;2;255;215;95m",
+        syntax: [
+            b"\x1b[38;2;105;105;105m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;95;135m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;135;215;135m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;175;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;95;215;215m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;135;175;255m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;215;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;175;135;255m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;175;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;175;135;255m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;95;135m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;215;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;215;175;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;135;135;135m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;215;95m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;135;175;255m\x1b[48;2;18;18;18m",
+            b"\x1b[38;2;255;175;95m\x1b[48;2;18;18;18m",
+            b"\x1b[1;38;2;255;55;75m\x1b[48;2;18;18;18m",
+        ],
+        git_added: b"\x1b[38;2;135;215;135m\x1b[48;2;18;18;18m",
+        git_modified: b"\x1b[38;2;255;175;95m\x1b[48;2;18;18;18m",
+        git_removed: b"\x1b[38;2;255;95;135m\x1b[48;2;18;18;18m",
         picker_selected: b"\x1b[38;2;18;18;18m\x1b[48;2;102;204;153m",
         cursor_color: b"\x1b]12;#ffd75f\x07",
     },
@@ -283,6 +561,29 @@ const THEMES: [Theme; 5] = [
         search_scope: b"\x1b[38;2;105;116;112m\x1b[48;2;240;235;218m",
         selection: b"\x1b[38;2;79;91;88m\x1b[48;2;211;222;203m",
         cursor: b"\x1b[38;2;253;246;227m\x1b[48;2;130;150;116m",
+        syntax: [
+            b"\x1b[38;2;147;157;148m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;229;112;110m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;141;161;118m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;229;165;100m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;53;167;124m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;62;121;144m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;223;160;55m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;160;107;155m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;229;165;100m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;160;107;155m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;229;112;110m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;223;160;55m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;130;150;116m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;147;157;148m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;223;160;55m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;62;121;144m\x1b[48;2;253;246;227m",
+            b"\x1b[38;2;229;165;100m\x1b[48;2;253;246;227m",
+            b"\x1b[1;38;2;205;55;55m\x1b[48;2;253;246;227m",
+        ],
+        git_added: b"\x1b[38;2;141;161;118m\x1b[48;2;253;246;227m",
+        git_modified: b"\x1b[38;2;229;165;100m\x1b[48;2;253;246;227m",
+        git_removed: b"\x1b[38;2;229;112;110m\x1b[48;2;253;246;227m",
         picker_selected: b"\x1b[38;2;253;246;227m\x1b[48;2;141;161;118m",
         cursor_color: b"\x1b]12;#829674\x07",
     },
@@ -294,6 +595,29 @@ const THEMES: [Theme; 5] = [
         search_scope: b"\x1b[38;2;166;180;190m\x1b[48;2;15;39;50m",
         selection: b"\x1b[38;2;226;232;240m\x1b[48;2;33;73;92m",
         cursor: b"\x1b[38;2;10;28;38m\x1b[48;2;73;214;183m",
+        syntax: [
+            b"\x1b[38;2;75;103;117m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;239;123;143m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;166;218;149m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;247;194;119m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;73;214;183m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;130;170;255m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;229;192;123m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;192;153;255m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;247;194;119m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;192;153;255m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;239;123;143m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;229;192;123m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;130;170;255m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;75;103;117m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;229;192;123m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;130;170;255m\x1b[48;2;10;28;38m",
+            b"\x1b[38;2;247;194;119m\x1b[48;2;10;28;38m",
+            b"\x1b[1;38;2;255;70;90m\x1b[48;2;10;28;38m",
+        ],
+        git_added: b"\x1b[38;2;166;218;149m\x1b[48;2;10;28;38m",
+        git_modified: b"\x1b[38;2;247;194;119m\x1b[48;2;10;28;38m",
+        git_removed: b"\x1b[38;2;239;123;143m\x1b[48;2;10;28;38m",
         picker_selected: b"\x1b[38;2;10;28;38m\x1b[48;2;73;214;183m",
         cursor_color: b"\x1b]12;#49d6b7\x07",
     },
@@ -305,6 +629,29 @@ const THEMES: [Theme; 5] = [
         search_scope: b"\x1b[38;2;190;186;196m\x1b[48;2;48;44;60m",
         selection: b"\x1b[38;2;239;236;228m\x1b[48;2;73;62;91m",
         cursor: b"\x1b[38;2;38;36;48m\x1b[48;2;205;145;165m",
+        syntax: [
+            b"\x1b[38;2;112;106;128m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;205;145;165m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;126;177;139m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;217;169;108m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;109;181;180m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;126;161;210m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;224;193;137m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;164;138;212m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;217;169;108m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;164;138;212m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;205;145;165m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;224;193;137m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;126;161;210m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;112;106;128m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;224;193;137m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;126;161;210m\x1b[48;2;38;36;48m",
+            b"\x1b[38;2;217;169;108m\x1b[48;2;38;36;48m",
+            b"\x1b[1;38;2;255;65;85m\x1b[48;2;38;36;48m",
+        ],
+        git_added: b"\x1b[38;2;126;177;139m\x1b[48;2;38;36;48m",
+        git_modified: b"\x1b[38;2;217;169;108m\x1b[48;2;38;36;48m",
+        git_removed: b"\x1b[38;2;205;145;165m\x1b[48;2;38;36;48m",
         picker_selected: b"\x1b[38;2;38;36;48m\x1b[48;2;205;145;165m",
         cursor_color: b"\x1b]12;#cd91a5\x07",
     },
@@ -314,6 +661,15 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
     let (root, initial_file, open_picker) = match path {
         Some(path) if path.is_dir() => (path, None, true),
         Some(path) => {
+            let path = std::fs::canonicalize(&path).unwrap_or_else(|_| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        .join(path)
+                }
+            });
             let root = path
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
@@ -328,6 +684,11 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
     };
     let discovery = project_discover(root, 1024);
     let project = discovery.project;
+    let rust_methods = if cfg!(test) {
+        rust_method_index_empty()
+    } else {
+        rust_method_index_start(&project.root, std::sync::Arc::clone(&project.paths))
+    };
     let ignore_status = project
         .ignore_file
         .as_ref()
@@ -359,19 +720,29 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
         mode: Mode::Normal,
         picker: None,
         pending_key: PendingKey::None,
+        pending_count: 0,
         last_accessed_document: None,
         config: EditorConfig {
-            flags: EditorFlags::AUTO_INDENTATION | EditorFlags::AUTO_INDENT_SCOPES,
+            flags: EditorFlags::AUTO_INDENTATION
+                | EditorFlags::AUTO_INDENT_SCOPES
+                | EditorFlags::AUTO_PAIRS,
             indentation_spaces: 4,
             scroll_margin_lines: 3,
         },
         viewport_height: 23,
+        terminal_width: 0,
+        terminal_height: 0,
         jumps: Vec::new(),
         jump_position: 0,
         quit_warning: false,
         quit_requested: false,
         status: ignore_status.unwrap_or_default(),
         frame: Vec::with_capacity(32 * 1024),
+        present_frame: Vec::with_capacity(8 * 1024),
+        rendered_row_hashes: Vec::new(),
+        rendered_theme: usize::MAX,
+        rendered_picker: false,
+        rendered_overlay_start: None,
         theme: 0,
         search_query: String::new(),
         search_matches: Vec::new(),
@@ -380,6 +751,14 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
         project_search,
         project_search_task,
         project_discovery,
+        rust_methods,
+        completion: None,
+        register: Register {
+            bytes: Vec::with_capacity(1024),
+            values: Vec::with_capacity(8),
+        },
+        clipboard_copy_task: None,
+        clipboard_paste_task: None,
     };
     if open_picker {
         editor_open_picker(&mut editor, PickerKind::Files);
@@ -390,6 +769,9 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
 pub fn document_empty() -> Document {
     Document {
         buffer: buffer_from_bytes(&[]),
+        syntax: syntax_highlighting_empty(),
+        code_index: code_index_empty(),
+        git_gutter: git_gutter_empty(),
         path: None,
         cursor: 0,
         anchor: 0,
@@ -415,6 +797,21 @@ pub fn document_open(path: Option<std::path::PathBuf>) -> std::io::Result<Docume
     let mut document = document_empty();
     document.buffer = buffer_from_bytes(&source);
     document.path = path;
+    syntax_highlighting_set_path(&mut document.syntax, document.path.as_deref());
+    code_index_set_path(&mut document.code_index, document.path.as_deref());
+    git_gutter_set_path(&mut document.git_gutter, document.path.as_deref());
+    syntax_highlighting_step(
+        &document.buffer,
+        &mut document.syntax,
+        256 * 1024,
+        std::time::Duration::from_millis(1),
+    );
+    code_index_step(
+        &document.buffer,
+        &mut document.code_index,
+        256 * 1024,
+        std::time::Duration::from_millis(1),
+    );
     Ok(document)
 }
 
@@ -433,27 +830,31 @@ pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Resu
     loop {
         let background_changed = editor_poll_project_discovery(editor)
             | editor_poll_project_search(editor)
-            | editor_step_project_search(editor);
+            | editor_step_project_search(editor)
+            | editor_step_syntax_highlighting(editor)
+            | editor_step_code_index(editor)
+            | editor_step_git_gutter(editor)
+            | editor_poll_rust_methods(editor)
+            | editor_poll_clipboard(editor);
         if input_changed || background_changed {
             match editor_render(editor, terminal) {
                 Ok(()) => {}
                 Err(error) => return Err(error),
             }
         }
-        let key = if editor_background_work_pending(editor) {
-            match terminal::terminal_read_key_timeout(terminal, 16) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    input_changed = false;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
+        let timeout = if editor_background_work_pending(editor) {
+            16
         } else {
-            match terminal::terminal_read_key(terminal) {
-                Ok(key) => key,
-                Err(error) => return Err(error),
+            100
+        };
+        let key = match terminal::terminal_read_key_timeout(terminal, timeout) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                let size = terminal::terminal_size(terminal);
+                input_changed = size != (editor.terminal_width, editor.terminal_height);
+                continue;
             }
+            Err(error) => return Err(error),
         };
         input_changed = true;
         if editor_handle_key(editor, key) {
@@ -474,6 +875,18 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
 
     if editor.pending_key != PendingKey::None {
         let pending = editor.pending_key;
+        if pending == PendingKey::Goto
+            && let Key::Character(character) = key
+            && let Some(digit) = character.to_digit(10)
+        {
+            editor.pending_count = editor
+                .pending_count
+                .saturating_mul(10)
+                .saturating_add(digit as usize);
+            return false;
+        }
+        let pending_count = editor.pending_count;
+        editor.pending_count = 0;
         editor.pending_key = PendingKey::None;
         match (pending, key) {
             (PendingKey::Space, Key::Character('f')) => {
@@ -483,17 +896,33 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             (PendingKey::Space, Key::Character('/')) => {
                 editor_open_picker(editor, PickerKind::SearchProject)
             }
+            (PendingKey::Space, Key::Character('s')) => {
+                editor_open_picker(editor, PickerKind::DocumentSymbols)
+            }
+            (PendingKey::Space, Key::Character('S')) => {
+                editor_open_picker(editor, PickerKind::WorkspaceSymbols)
+            }
+            (PendingKey::Space, Key::Character('Y')) => editor_yank_system(editor),
+            (PendingKey::Space, Key::Character('P')) => editor_paste_system(editor),
             (PendingKey::SpaceTheme, Key::Character('d' | 'k')) => editor_set_theme(editor, 0),
             (PendingKey::SpaceTheme, Key::Character('b')) => editor_set_theme(editor, 1),
             (PendingKey::SpaceTheme, Key::Character('l')) => editor_set_theme(editor, 2),
             (PendingKey::SpaceTheme, Key::Character('n')) => editor_set_theme(editor, 3),
             (PendingKey::SpaceTheme, Key::Character('v')) => editor_set_theme(editor, 4),
-            (PendingKey::Goto, Key::Character('g')) => editor_goto_file_start(editor),
+            (PendingKey::Goto, Key::Character('g')) => {
+                if pending_count == 0 {
+                    editor_goto_file_start(editor);
+                } else {
+                    editor_goto_line(editor, pending_count.saturating_sub(1));
+                }
+            }
             (PendingKey::Goto, Key::Character('e')) => editor_goto_last_line(editor),
             (PendingKey::Goto, Key::Character('h')) => editor_move_line_boundary(editor, false),
             (PendingKey::Goto, Key::Character('l')) => editor_move_line_boundary(editor, true),
             (PendingKey::Goto, Key::Character('s')) => editor_goto_first_nonwhitespace(editor),
             (PendingKey::Goto, Key::Character('a')) => editor_goto_last_accessed_document(editor),
+            (PendingKey::Goto, Key::Character('d')) => editor_goto_definition(editor),
+            (PendingKey::Goto, Key::Character('r')) => editor_select_references(editor),
             (PendingKey::Goto, Key::Character('n')) => {
                 editor_switch_document(editor, (editor.current + 1) % editor.documents.len())
             }
@@ -516,10 +945,36 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
                 editor.pending_key = PendingKey::MatchInside
             }
             (PendingKey::MatchAround, Key::Character(delimiter)) => {
-                editor_select_surrounding(editor, delimiter, false)
+                if delimiter == 'f' {
+                    editor_select_enclosing_function(editor, false);
+                } else {
+                    editor_select_surrounding(editor, delimiter, false);
+                }
             }
             (PendingKey::MatchInside, Key::Character(delimiter)) => {
-                editor_select_surrounding(editor, delimiter, true)
+                if delimiter == 'f' {
+                    editor_select_enclosing_function(editor, true);
+                } else {
+                    editor_select_surrounding(editor, delimiter, true);
+                }
+            }
+            (PendingKey::InsertLineAbove, Key::Character(' ')) => {
+                editor_insert_blank_lines(editor, false)
+            }
+            (PendingKey::InsertLineBelow, Key::Character(' ')) => {
+                editor_insert_blank_lines(editor, true)
+            }
+            (PendingKey::InsertLineAbove, Key::Character('g')) => {
+                editor_goto_git_change(editor, false)
+            }
+            (PendingKey::InsertLineBelow, Key::Character('g')) => {
+                editor_goto_git_change(editor, true)
+            }
+            (PendingKey::InsertLineAbove, Key::Character('f')) => {
+                editor_goto_function(editor, false)
+            }
+            (PendingKey::InsertLineBelow, Key::Character('f')) => {
+                editor_goto_function(editor, true)
             }
             _ => {}
         }
@@ -626,6 +1081,9 @@ pub fn document_undo(document: &mut Document) {
     let Some(transaction) = document.undo.pop() else {
         return;
     };
+    syntax_highlighting_invalidate(&mut document.syntax);
+    code_index_invalidate(&mut document.code_index);
+    git_gutter_invalidate(&mut document.git_gutter);
     for edit in transaction.edits.iter().rev() {
         for atom in edit.atoms.iter().rev() {
             buffer_delete(
@@ -650,6 +1108,9 @@ pub fn document_redo(document: &mut Document) {
     let Some(transaction) = document.redo.pop() else {
         return;
     };
+    syntax_highlighting_invalidate(&mut document.syntax);
+    code_index_invalidate(&mut document.code_index);
+    git_gutter_invalidate(&mut document.git_gutter);
     for edit in &transaction.edits {
         for atom in edit.atoms.iter().rev() {
             buffer_delete(
@@ -720,12 +1181,42 @@ pub fn document_replace_ranges(
     }
     replacements.sort_unstable_by_key(|replacement| replacement.start);
     replacements.dedup_by(|right, left| right.start == left.start && right.end == left.end);
+    let temp = idno_std::mem().scratch().temp();
+    let mut byte_edits = temp.vec(replacements.len());
+    let mut line_edits = temp.vec(replacements.len());
+    let mut scan_position = 0;
+    let mut scan_line = 0;
+    for replacement in replacements.iter() {
+        while scan_position < replacement.start {
+            scan_line += usize::from(buffer_byte(&document.buffer, scan_position) == b'\n');
+            scan_position += 1;
+        }
+        let start_line = scan_line;
+        while scan_position < replacement.end {
+            scan_line += usize::from(buffer_byte(&document.buffer, scan_position) == b'\n');
+            scan_position += 1;
+        }
+        let inserted_lines = inserted_bytes[replacement.inserted.clone()]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        byte_edits.push((
+            replacement.start,
+            replacement.end,
+            replacement.inserted.len(),
+        ));
+        line_edits.push((start_line, scan_line, inserted_lines));
+    }
+    syntax_highlighting_invalidate(&mut document.syntax);
+    syntax_highlighting_adjust_edits(&mut document.syntax, &byte_edits);
+    code_index_invalidate(&mut document.code_index);
+    git_gutter_invalidate(&mut document.git_gutter);
+    git_gutter_adjust_edits(&mut document.git_gutter, &line_edits);
     let mut before = Vec::with_capacity(document.secondary_selections.len() + 1);
     document_selections(document, &mut before);
     let retained_insert_selection = document.active_transaction.is_some()
         && !document.insertion_points.is_empty()
         && requested_after.is_none();
-    let temp = idno_std::mem().scratch().temp();
     let mut retained_selection_bounds = temp.vec(before.len());
     let mut transformed_insertion_points = temp.vec(document.insertion_points.len());
     if retained_insert_selection {
@@ -734,6 +1225,7 @@ pub fn document_replace_ranges(
                 selection.anchor.min(selection.cursor),
                 buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor)),
                 selection.anchor <= selection.cursor,
+                selection.anchor != selection.cursor,
             ));
         }
         for &position in &document.insertion_points {
@@ -786,7 +1278,17 @@ pub fn document_replace_ranges(
     if let Some(requested_after) = requested_after {
         after.extend_from_slice(requested_after);
     } else if retained_insert_selection {
-        for &(start, end, forward) in &retained_selection_bounds {
+        for (selection_index, &(start, end, forward, extended)) in
+            retained_selection_bounds.iter().enumerate()
+        {
+            if !extended {
+                let position = transformed_insertion_points[selection_index];
+                after.push(SelectionState {
+                    cursor: position,
+                    anchor: position,
+                });
+                continue;
+            }
             let new_start = offset_after_replacements(start, false, replacements);
             let new_end = offset_after_replacements(end, true, replacements);
             let new_head = if new_end > new_start {
@@ -883,7 +1385,28 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         search_complete: kind != PickerKind::SearchProject,
         search_seen: Vec::new(),
         search_ranked: Vec::new(),
+        symbol_corpus: SearchCorpus {
+            bytes: Vec::new(),
+            lines: Vec::new(),
+        },
+        symbol_candidates: Vec::new(),
+        rust_symbol_candidates: Vec::new(),
+        reference_targets: Vec::new(),
     };
+    if kind == PickerKind::DocumentSymbols {
+        search_corpus_index_document(editor_document(editor), &mut picker.symbol_corpus);
+        symbol_candidates_collect(&picker.symbol_corpus, None, &mut picker.symbol_candidates);
+    } else if kind == PickerKind::WorkspaceSymbols {
+        if rust_method_index_pending(&editor.rust_methods) {
+            editor
+                .status
+                .push_str("workspace symbol index is still loading");
+            return;
+        }
+        picker
+            .rust_symbol_candidates
+            .extend(0..editor.rust_methods.corpus.symbols.len());
+    }
     picker_refresh(editor, &mut picker);
     editor.picker = Some(picker);
 }
@@ -921,6 +1444,50 @@ pub fn picker_refresh(editor: &Editor, picker: &mut Picker) {
         }
         PickerKind::SearchProject => {
             picker_project_search_begin(editor, picker);
+        }
+        PickerKind::DocumentSymbols => {
+            let temp = idno_std::mem().scratch().temp();
+            let mut labels = temp.vec(picker.symbol_candidates.len());
+            for &line_index in &picker.symbol_candidates {
+                let line = picker.symbol_corpus.lines[line_index];
+                let source = &picker.symbol_corpus.bytes
+                    [line.text_start as usize..line.display_end as usize];
+                let Some((start, end)) = rust_symbol_name_range(source) else {
+                    labels.push("");
+                    continue;
+                };
+                labels.push(std::str::from_utf8(&source[start..end]).unwrap_or(""));
+            }
+            fuzzy_rank(&picker.query, &labels, &mut picker.matches);
+        }
+        PickerKind::WorkspaceSymbols => {
+            let temp = idno_std::mem().scratch().temp();
+            let mut labels = temp.vec(picker.rust_symbol_candidates.len());
+            for &symbol in &picker.rust_symbol_candidates {
+                labels.push(rust_symbol_name(&editor.rust_methods.corpus, symbol));
+            }
+            fuzzy_rank(&picker.query, &labels, &mut picker.matches);
+        }
+        PickerKind::References => {
+            if picker.query.is_empty() {
+                picker.matches.clear();
+                picker.matches.extend(
+                    (0..picker.reference_targets.len()).map(|item| FuzzyMatch { item, score: 0 }),
+                );
+            } else {
+                let temp = idno_std::mem().scratch().temp();
+                let mut labels = temp.vec(picker.symbol_corpus.lines.len());
+                for line in &picker.symbol_corpus.lines {
+                    labels.push(
+                        std::str::from_utf8(
+                            &picker.symbol_corpus.bytes
+                                [line.display_start as usize..line.display_end as usize],
+                        )
+                        .unwrap_or(""),
+                    );
+                }
+                fuzzy_rank(&picker.query, &labels, &mut picker.matches);
+            }
         }
     }
     picker.selected = picker
@@ -1018,6 +1585,59 @@ fn editor_accept_picker(editor: &mut Editor) {
             }
         }
         PickerKind::SearchProject => editor_accept_project_search(editor, &picker, item),
+        PickerKind::DocumentSymbols => {
+            let line_index = picker.symbol_candidates[item];
+            let line = picker.symbol_corpus.lines[line_index];
+            let source =
+                &picker.symbol_corpus.bytes[line.text_start as usize..line.display_end as usize];
+            let Some((name_start, name_end)) = rust_symbol_name_range(source) else {
+                return;
+            };
+            editor_select_symbol(
+                editor,
+                line.file_offset as usize + name_start,
+                line.file_offset as usize + name_end,
+            );
+        }
+        PickerKind::WorkspaceSymbols => {
+            let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
+                return;
+            };
+            let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+                return;
+            };
+            let path = path.to_path_buf();
+            let definition = editor.rust_methods.corpus.symbols[symbol];
+            editor_navigate_to_symbol(
+                editor,
+                &path,
+                definition.position as usize,
+                definition.end as usize,
+            );
+        }
+        PickerKind::References => {
+            let Some(target) = picker.reference_targets.get(item).copied() else {
+                return;
+            };
+            if target.project_file == u32::MAX {
+                editor_select_symbol(editor, target.start as usize, target.end as usize);
+            } else {
+                let Some(path) = editor
+                    .project
+                    .paths
+                    .get(target.project_file as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                editor_navigate_to_symbol(
+                    editor,
+                    &path,
+                    target.start as usize,
+                    target.end as usize,
+                );
+            }
+        }
     }
 }
 
@@ -1062,7 +1682,11 @@ fn picker_complete(editor: &Editor, picker: &mut Picker) {
         return;
     };
     match picker.kind {
-        PickerKind::Files | PickerKind::SearchProject => {}
+        PickerKind::Files
+        | PickerKind::SearchProject
+        | PickerKind::DocumentSymbols
+        | PickerKind::WorkspaceSymbols
+        | PickerKind::References => {}
         PickerKind::Commands => {
             if command_theme_argument(&picker.query).is_some() {
                 let command_end = picker
@@ -1128,6 +1752,15 @@ fn editor_poll_project_discovery(editor: &mut Editor) -> bool {
             ));
         } else {
             editor.project_search_task = Some(project_search_spawn(&editor.project));
+        }
+        if let Some(task) = editor.rust_methods.task.take() {
+            task.cancel();
+        }
+        if !cfg!(test) {
+            editor.rust_methods = rust_method_index_start(
+                &editor.project.root,
+                std::sync::Arc::clone(&editor.project.paths),
+            );
         }
     } else {
         editor.project_discovery = Some(discovery);
@@ -1344,9 +1977,59 @@ fn editor_step_project_search(editor: &mut Editor) -> bool {
 fn editor_background_work_pending(editor: &Editor) -> bool {
     editor.project_discovery.is_some()
         || editor.project_search_task.is_some()
+        || !editor_document(editor).syntax.complete
+        || !editor_document(editor).code_index.complete
+        || git_gutter_pending(&editor_document(editor).git_gutter)
+        || rust_method_index_pending(&editor.rust_methods)
+        || editor.clipboard_copy_task.is_some()
+        || editor.clipboard_paste_task.is_some()
         || editor.picker.as_ref().is_some_and(|picker| {
             picker.kind == PickerKind::SearchProject && !picker.search_complete
         })
+}
+
+fn editor_poll_rust_methods(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    if !rust_method_index_poll(&mut editor.rust_methods) {
+        return false;
+    }
+    editor_refresh_completion(editor);
+    true
+}
+
+fn editor_step_syntax_highlighting(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    syntax_highlighting_step(
+        &document.buffer,
+        &mut document.syntax,
+        128 * 1024,
+        std::time::Duration::from_micros(500),
+    )
+}
+
+fn editor_step_code_index(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    code_index_step(
+        &document.buffer,
+        &mut document.code_index,
+        128 * 1024,
+        std::time::Duration::from_micros(500),
+    )
+}
+
+fn editor_step_git_gutter(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    let polled = git_gutter_poll(&mut document.git_gutter);
+    let stepped = git_gutter_step(
+        &document.buffer,
+        &mut document.git_gutter,
+        128 * 1024,
+        std::time::Duration::from_micros(500),
+    );
+    polled || stepped
 }
 
 fn search_corpus_index_document(document: &Document, corpus: &mut SearchCorpus) {
@@ -1379,6 +2062,94 @@ fn search_corpus_index_document(document: &Document, corpus: &mut SearchCorpus) 
         }
         start = end + 1;
         line_number += 1;
+    }
+}
+
+fn symbol_candidates_collect(
+    corpus: &SearchCorpus,
+    workspace_labels: Option<(&[String], bool)>,
+    candidates: &mut Vec<usize>,
+) {
+    profiling::function_scope!();
+    candidates.clear();
+    for (line_index, line) in corpus.lines.iter().enumerate() {
+        if let Some((labels, rust_only)) = workspace_labels {
+            let project_file = line.project_file as usize;
+            if project_file >= labels.len() || (rust_only && !labels[project_file].ends_with(".rs"))
+            {
+                continue;
+            }
+        }
+        let source = &corpus.bytes[line.text_start as usize..line.display_end as usize];
+        if rust_symbol_name_range(source).is_some() {
+            candidates.push(line_index);
+        }
+    }
+}
+
+fn rust_symbol_name_range(line: &[u8]) -> Option<(usize, usize)> {
+    let mut position = 0;
+    rust_skip_ascii_whitespace(line, &mut position);
+    loop {
+        let start = position;
+        while position < line.len()
+            && (line[position].is_ascii_alphanumeric() || line[position] == b'_')
+        {
+            position += 1;
+        }
+        let word = &line[start..position];
+        if word == b"pub" {
+            rust_skip_ascii_whitespace(line, &mut position);
+            if position < line.len() && line[position] == b'(' {
+                let mut depth = 1usize;
+                position += 1;
+                while position < line.len() && depth > 0 {
+                    depth += usize::from(line[position] == b'(');
+                    depth = depth.saturating_sub(usize::from(line[position] == b')'));
+                    position += 1;
+                }
+                rust_skip_ascii_whitespace(line, &mut position);
+            }
+            continue;
+        }
+        if matches!(
+            word,
+            b"async" | b"const" | b"unsafe" | b"extern" | b"default"
+        ) {
+            rust_skip_ascii_whitespace(line, &mut position);
+            if word == b"extern" && position < line.len() && line[position] == b'"' {
+                position += 1;
+                while position < line.len() && line[position] != b'"' {
+                    position += 1;
+                }
+                position = (position + usize::from(position < line.len())).min(line.len());
+                rust_skip_ascii_whitespace(line, &mut position);
+            }
+            continue;
+        }
+        if !matches!(
+            word,
+            b"fn" | b"struct" | b"enum" | b"trait" | b"type" | b"mod" | b"static" | b"let"
+        ) {
+            return None;
+        }
+        rust_skip_ascii_whitespace(line, &mut position);
+        if word == b"let" && line.get(position..position + 4) == Some(b"mut ") {
+            position += 4;
+        }
+        let name_start = position;
+        while position < line.len()
+            && (line[position].is_ascii_alphanumeric() || line[position] == b'_')
+        {
+            position += 1;
+        }
+        return (position > name_start).then_some((name_start, position));
+    }
+}
+
+fn rust_skip_ascii_whitespace(line: &[u8], position: &mut usize) {
+    while *position < line.len() && line[*position].is_ascii_whitespace() {
+        *position += 1;
     }
 }
 
@@ -1462,8 +2233,6 @@ fn editor_accept_project_search(editor: &mut Editor, picker: &Picker, item: usiz
     let Some(line) = corpus.lines.get(item).copied() else {
         return;
     };
-    let text = &corpus.bytes[line.text_start as usize..line.display_end as usize];
-    let span = fuzzy_subsequence_span(picker.query.as_bytes(), text);
     editor_open_project_file(editor, line.project_file as usize);
     let searched_project_file = line.project_file;
     editor.search_query.clear();
@@ -1492,16 +2261,12 @@ fn editor_accept_project_search(editor: &mut Editor, picker: &Picker, item: usiz
     let document = editor_document_mut(editor);
     let file_offset = line.file_offset as usize;
     let line_end = buffer_line_end(&document.buffer, file_offset);
-    let (start, end) = match span {
-        Some((start, end)) => (
-            (file_offset + start).min(line_end),
-            (file_offset + end).min(line_end),
-        ),
-        None => (file_offset.min(line_end), file_offset.min(line_end)),
-    };
+    let start = file_offset.min(line_end);
     document.anchor = start;
-    document.cursor = if end > start {
-        buffer_previous_char(&document.buffer, end)
+    document.cursor = if line_end < buffer_len(&document.buffer) {
+        line_end
+    } else if line_end > start {
+        buffer_previous_char(&document.buffer, line_end)
     } else {
         start
     };
@@ -1510,14 +2275,15 @@ fn editor_accept_project_search(editor: &mut Editor, picker: &Picker, item: usiz
     editor.search_position = editor
         .search_matches
         .iter()
-        .position(|selection| selection.anchor == start)
+        .position(|selection| start <= selection.anchor && selection.anchor <= line_end)
         .unwrap_or(0);
     editor.mode = Mode::Normal;
 }
 
 fn editor_start_search(editor: &mut Editor, kind: SearchKind) {
     profiling::function_scope!();
-    let document = editor_document(editor);
+    let current = editor.current;
+    let document = &editor.documents[current];
     let mut original_selections = Vec::with_capacity(document.secondary_selections.len() + 1);
     document_selections(document, &mut original_selections);
     let mut corpus = SearchCorpus {
@@ -1545,7 +2311,7 @@ fn editor_search_refresh(editor: &Editor, search: &mut SearchSession) {
     }
     match search.kind {
         SearchKind::Document => {
-            search_document_fuzzy_matches(search);
+            search_document_exact_matches(search);
             search
                 .matches
                 .sort_unstable_by_key(|selection| selection.anchor);
@@ -1565,26 +2331,25 @@ fn editor_search_refresh(editor: &Editor, search: &mut SearchSession) {
     }
 }
 
-fn search_document_fuzzy_matches(search: &mut SearchSession) {
+fn search_document_exact_matches(search: &mut SearchSession) {
     profiling::function_scope!();
-    let temp = idno_std::mem().scratch().temp();
-    let mut labels = temp.vec(search.corpus.lines.len());
+    let query = search.query.as_bytes();
     for line in &search.corpus.lines {
         let text = &search.corpus.bytes[line.text_start as usize..line.display_end as usize];
-        labels.push(std::str::from_utf8(text).unwrap_or(""));
-    }
-    let mut ranked = temp.vec(search.corpus.lines.len());
-    fuzzy_rank(&search.query, &labels, &mut ranked);
-    search.matches.reserve(ranked.len());
-    for found in &ranked {
-        let line = search.corpus.lines[found.item];
-        let text = &search.corpus.bytes[line.text_start as usize..line.display_end as usize];
-        if let Some((start, end)) = fuzzy_subsequence_span(search.query.as_bytes(), text) {
-            let file_offset = line.file_offset as usize;
-            search.matches.push(SelectionState {
-                anchor: file_offset + start,
-                cursor: file_offset + end.saturating_sub(1),
-            });
+        let mut start = 0;
+        while start + query.len() <= text.len() {
+            let matched = query
+                .iter()
+                .enumerate()
+                .all(|(offset, &query_byte)| fuzzy_byte_matches(query_byte, text[start + offset]));
+            if matched {
+                let file_offset = line.file_offset as usize;
+                search.matches.push(SelectionState {
+                    anchor: file_offset + start,
+                    cursor: file_offset + start + query.len().saturating_sub(1),
+                });
+            }
+            start += 1;
         }
     }
 }
@@ -1774,39 +2539,52 @@ pub fn editor_open_project_file(editor: &mut Editor, project_file: usize) {
     let Some(path) = editor.project.paths.get(project_file).cloned() else {
         return;
     };
+    let Some(target) = editor_document_target(editor, path) else {
+        return;
+    };
+    editor_switch_document(editor, target);
+}
+
+fn editor_document_target(editor: &mut Editor, path: std::path::PathBuf) -> Option<usize> {
+    profiling::function_scope!();
     let path = std::fs::canonicalize(&path).unwrap_or(path);
-    let document_index = editor.documents.iter().position(|document| {
+    if let Some(document) = editor.documents.iter().position(|document| {
         document.path.as_ref().is_some_and(|open| {
             std::fs::canonicalize(open).unwrap_or_else(|_| open.clone()) == path
         })
-    });
-    let target = match document_index {
-        Some(document) => document,
-        None => match document_open(Some(path)) {
-            Ok(document) => {
-                editor.documents.push(document);
-                editor.documents.len() - 1
-            }
-            Err(error) => {
-                write!(&mut editor.status, "open failed: {error}").unwrap();
-                return;
-            }
-        },
-    };
-    editor_switch_document(editor, target);
+    }) {
+        return Some(document);
+    }
+    match document_open(Some(path)) {
+        Ok(document) => {
+            editor.documents.push(document);
+            Some(editor.documents.len() - 1)
+        }
+        Err(error) => {
+            write!(&mut editor.status, "open failed: {error}").unwrap();
+            None
+        }
+    }
 }
 
 pub fn editor_switch_document(editor: &mut Editor, target: usize) {
     if target == editor.current || target >= editor.documents.len() {
         return;
     }
-    document_commit_transaction(editor_document_mut(editor));
     let before = editor_location(editor);
+    editor_switch_document_state(editor, target);
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
+}
+
+fn editor_switch_document_state(editor: &mut Editor, target: usize) {
+    if target == editor.current || target >= editor.documents.len() {
+        return;
+    }
+    document_commit_transaction(editor_document_mut(editor));
     editor.last_accessed_document = Some(editor.current);
     editor.current = target;
     editor.mode = Mode::Normal;
-    let after = editor_location(editor);
-    editor_record_jump(editor, before, after);
 }
 
 pub fn editor_location(editor: &Editor) -> Jump {
@@ -1936,6 +2714,8 @@ pub fn editor_execute_command(editor: &mut Editor, input: &str) {
             }
             editor.status.push_str("project files reloaded");
         }
+        "reload" | "reload!" | "rl" | "rl!" => editor_reload_document(editor),
+        "reload-all" | "reload-all!" | "rla" | "rla!" => editor_reload_all_documents(editor),
         "toggle-auto-indentation" => {
             let enabled = !editor.config.flags.contains(EditorFlags::AUTO_INDENTATION);
             editor
@@ -1953,8 +2733,85 @@ pub fn editor_execute_command(editor: &mut Editor, input: &str) {
                 .flags
                 .set(EditorFlags::AUTO_INDENT_SCOPES, enabled);
         }
+        "toggle-auto-pairs" => {
+            let enabled = !editor.config.flags.contains(EditorFlags::AUTO_PAIRS);
+            editor.config.flags.set(EditorFlags::AUTO_PAIRS, enabled);
+        }
         _ => write!(&mut editor.status, "unknown command: {command}").unwrap(),
     }
+}
+
+fn editor_reload_document(editor: &mut Editor) {
+    profiling::function_scope!();
+    document_commit_transaction(editor_document_mut(editor));
+    let Some(path) = editor_document(editor).path.as_deref() else {
+        editor
+            .status
+            .push_str("scratch buffer has no file to reload");
+        return;
+    };
+    let source = match std::fs::read(path) {
+        Ok(source) => source,
+        Err(error) => {
+            write!(&mut editor.status, "reload failed: {error}").unwrap();
+            return;
+        }
+    };
+    let unchanged = {
+        let document = editor_document(editor);
+        source.len() == buffer_len(&document.buffer)
+            && source
+                .iter()
+                .enumerate()
+                .all(|(position, &byte)| buffer_byte(&document.buffer, position) == byte)
+    };
+    if unchanged {
+        editor_document_mut(editor).modified = false;
+        editor.status.push_str("buffer already matches disk");
+        return;
+    }
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut replacements = temp.vec(1);
+    replacements.push(Replacement {
+        start: 0,
+        end: buffer_len(&document.buffer),
+        inserted: 0..source.len(),
+    });
+    let mut cursor = document.cursor.min(source.len());
+    while cursor > 0 && cursor < source.len() && source[cursor] & 0b1100_0000 == 0b1000_0000 {
+        cursor -= 1;
+    }
+    if cursor == source.len() && cursor > 0 && source[cursor - 1] != b'\n' {
+        cursor -= 1;
+        while cursor > 0 && source[cursor] & 0b1100_0000 == 0b1000_0000 {
+            cursor -= 1;
+        }
+    }
+    let after = [SelectionState {
+        cursor,
+        anchor: cursor,
+    }];
+    document_replace_ranges(document, &mut replacements, &source, Some(&after));
+    document.modified = false;
+    write!(&mut editor.status, "reloaded {} bytes", source.len()).unwrap();
+}
+
+fn editor_reload_all_documents(editor: &mut Editor) {
+    profiling::function_scope!();
+    let current = editor.current;
+    let mut reloaded = 0;
+    for document in 0..editor.documents.len() {
+        if editor.documents[document].path.is_none() {
+            continue;
+        }
+        editor.current = document;
+        editor_reload_document(editor);
+        reloaded += usize::from(!editor.documents[document].modified);
+    }
+    editor.current = current.min(editor.documents.len().saturating_sub(1));
+    editor.status.clear();
+    write!(&mut editor.status, "reloaded {reloaded} buffer(s)").unwrap();
 }
 
 fn editor_set_document_path(editor: &mut Editor, path: &str) {
@@ -1964,7 +2821,11 @@ fn editor_set_document_path(editor: &mut Editor, path: &str) {
     } else {
         editor.project.root.join(path)
     };
-    editor_document_mut(editor).path = Some(path);
+    let document = editor_document_mut(editor);
+    document.path = Some(path);
+    syntax_highlighting_set_path(&mut document.syntax, document.path.as_deref());
+    code_index_set_path(&mut document.code_index, document.path.as_deref());
+    git_gutter_set_path(&mut document.git_gutter, document.path.as_deref());
 }
 
 fn editor_open_path(editor: &mut Editor, path: &str) {
@@ -1975,21 +2836,8 @@ fn editor_open_path(editor: &mut Editor, path: &str) {
     } else {
         editor.project.root.join(path)
     };
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
-    if let Some(target) = editor.documents.iter().position(|document| {
-        document.path.as_ref().is_some_and(|open| {
-            std::fs::canonicalize(open).unwrap_or_else(|_| open.clone()) == path
-        })
-    }) {
+    if let Some(target) = editor_document_target(editor, path) {
         editor_switch_document(editor, target);
-        return;
-    }
-    match document_open(Some(path)) {
-        Ok(document) => {
-            editor.documents.push(document);
-            editor_switch_document(editor, editor.documents.len() - 1);
-        }
-        Err(error) => write!(&mut editor.status, "open failed: {error}").unwrap(),
     }
 }
 
@@ -2084,26 +2932,47 @@ fn editor_set_theme(editor: &mut Editor, theme: usize) {
 fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
     match key {
         Key::Escape => {
-            editor.mode = Mode::Normal;
-            let document = editor_document_mut(editor);
-            document.insertion_points.clear();
-            document_commit_transaction(document);
+            editor.completion = None;
+            editor_exit_insert(editor);
         }
         Key::Backspace => {
+            let indentation_spaces = editor.config.indentation_spaces.max(1);
             let document = editor_document_mut(editor);
             let temp = idno_std::mem().scratch().temp();
             let mut replacements = temp.vec(document.insertion_points.len());
             for &position in &document.insertion_points {
                 if position > 0 {
                     let previous = buffer_previous_char(&document.buffer, position);
+                    let paired = position < buffer_len(&document.buffer)
+                        && matches!(
+                            (
+                                buffer_byte(&document.buffer, previous),
+                                buffer_byte(&document.buffer, position)
+                            ),
+                            (b'(', b')') | (b'[', b']') | (b'{', b'}') | (b'"', b'"')
+                        );
+                    let start = if paired {
+                        previous
+                    } else {
+                        editor_indentation_backspace_start(
+                            &document.buffer,
+                            position,
+                            indentation_spaces,
+                        )
+                    };
                     replacements.push(Replacement {
-                        start: previous,
-                        end: position,
+                        start,
+                        end: if paired {
+                            buffer_next_char(&document.buffer, position)
+                        } else {
+                            position
+                        },
                         inserted: 0..0,
                     });
                 }
             }
             document_replace_ranges(document, &mut replacements, &[], None);
+            editor_refresh_completion(editor);
         }
         Key::Delete => {
             let document = editor_document_mut(editor);
@@ -2121,11 +2990,31 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
             }
             document_replace_ranges(document, &mut replacements, &[], None);
         }
-        Key::Enter => editor_insert_newline(editor),
+        Key::Enter => {
+            editor.completion = None;
+            editor_insert_newline(editor);
+        }
+        Key::Tab if editor.completion.is_some() => editor_accept_completion(editor),
         Key::Tab => editor_insert(editor, "\t"),
         Key::Character(character) => {
+            if editor.config.flags.contains(EditorFlags::AUTO_PAIRS)
+                && editor_insert_auto_pair(editor, character)
+            {
+                editor_refresh_completion(editor);
+                return false;
+            }
             let mut encoded = [0; 4];
             editor_insert(editor, character.encode_utf8(&mut encoded));
+            editor_refresh_completion(editor);
+        }
+        Key::Control(14) if editor.completion.is_some() => {
+            let completion = editor.completion.as_mut().unwrap();
+            completion.selected =
+                (completion.selected + 1).min(completion.matches.len().saturating_sub(1));
+        }
+        Key::Control(16) if editor.completion.is_some() => {
+            let completion = editor.completion.as_mut().unwrap();
+            completion.selected = completion.selected.saturating_sub(1);
         }
         Key::Left => editor_move_insert_points_horizontal(editor, false),
         Key::Right => editor_move_insert_points_horizontal(editor, true),
@@ -2138,6 +3027,95 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
     false
 }
 
+fn editor_indentation_backspace_start(
+    buffer: &GapBuffer,
+    position: usize,
+    indentation_spaces: usize,
+) -> usize {
+    let previous = buffer_previous_char(buffer, position);
+    if indentation_spaces <= 1 || buffer_byte(buffer, previous) != b' ' {
+        return previous;
+    }
+    let line_start = buffer_line_start(buffer, position);
+    let indentation_length = position - line_start;
+    if indentation_length < indentation_spaces
+        || !indentation_length.is_multiple_of(indentation_spaces)
+    {
+        return previous;
+    }
+    let unit_start = position - indentation_spaces;
+    if (line_start..position).all(|index| matches!(buffer_byte(buffer, index), b' ' | b'\t'))
+        && (unit_start..position).all(|index| buffer_byte(buffer, index) == b' ')
+    {
+        unit_start
+    } else {
+        previous
+    }
+}
+
+fn editor_exit_insert(editor: &mut Editor) {
+    profiling::function_scope!();
+    editor.mode = Mode::Normal;
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut replacements = temp.vec(document.insertion_points.len());
+    for &insertion_point in &document.insertion_points {
+        let line_start = buffer_line_start(&document.buffer, insertion_point);
+        let line_end = buffer_line_end(&document.buffer, insertion_point);
+        let mut only_indentation = line_start < line_end;
+        let mut position = line_start;
+        while position < line_end {
+            if !matches!(buffer_byte(&document.buffer, position), b' ' | b'\t') {
+                only_indentation = false;
+                break;
+            }
+            position += 1;
+        }
+        if only_indentation {
+            replacements.push(Replacement {
+                start: line_start,
+                end: line_end,
+                inserted: 0..0,
+            });
+        }
+    }
+    document_replace_ranges(document, &mut replacements, &[], None);
+    let edited = document
+        .active_transaction
+        .as_ref()
+        .is_some_and(|transaction| !transaction.edits.is_empty());
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    for (selection, &insertion_point) in selections.iter_mut().zip(&document.insertion_points) {
+        let insertion_point = insertion_point.min(buffer_len(&document.buffer));
+        let empty_line = buffer_line_start(&document.buffer, insertion_point)
+            == buffer_line_end(&document.buffer, insertion_point);
+        let head = if empty_line {
+            insertion_point
+        } else if edited && insertion_point > 0 {
+            buffer_previous_char(&document.buffer, insertion_point)
+        } else {
+            command_cursor_clamped(&document.buffer, insertion_point, Mode::Normal)
+        };
+        let start = selection.anchor.min(selection.cursor);
+        let end = selection.anchor.max(selection.cursor);
+        if start == end {
+            selection.anchor = head;
+            selection.cursor = head;
+            continue;
+        }
+        selection.anchor = if head.abs_diff(start) >= head.abs_diff(end) {
+            start
+        } else {
+            end
+        };
+        selection.cursor = head;
+    }
+    document_set_selections(document, &selections);
+    document.insertion_points.clear();
+    document_commit_transaction(document);
+}
+
 fn editor_handle_command_key(editor: &mut Editor, key: Key) -> bool {
     match key {
         Key::Character(':') => editor_open_picker(editor, PickerKind::Commands),
@@ -2147,7 +3125,12 @@ fn editor_handle_command_key(editor: &mut Editor, key: Key) -> bool {
             editor.pending_key = PendingKey::Space
         }
         Key::Character('m') => editor.pending_key = PendingKey::Match,
-        Key::Character('g') => editor.pending_key = PendingKey::Goto,
+        Key::Character('g') => {
+            editor.pending_count = 0;
+            editor.pending_key = PendingKey::Goto;
+        }
+        Key::Character('[') => editor.pending_key = PendingKey::InsertLineAbove,
+        Key::Character(']') => editor.pending_key = PendingKey::InsertLineBelow,
         Key::Character('i') if editor.mode == Mode::Normal => {
             editor_enter_insert(editor, false);
             editor.mode = Mode::Insert;
@@ -2207,6 +3190,9 @@ fn editor_handle_command_key(editor: &mut Editor, key: Key) -> bool {
         Key::Character('x') => editor_select_lines(editor),
         Key::Character('X') => editor_select_current_lines(editor),
         Key::Character('d') | Key::Delete => editor_delete_selection(editor),
+        Key::Character('y') => editor_yank(editor),
+        Key::Character('p') => editor_paste_register(editor, true),
+        Key::Character('P') => editor_paste_register(editor, false),
         Key::Character('c') => editor_change_selection(editor),
         Key::Character(';') => editor_collapse_selections(editor),
         Key::Character(',') => editor_keep_primary_selection(editor),
@@ -2244,6 +3230,122 @@ fn editor_insert(editor: &mut Editor, text: &str) {
     }
     document_replace_ranges(document, &mut replacements, text.as_bytes(), None);
     editor.quit_warning = false;
+}
+
+fn editor_insert_auto_pair(editor: &mut Editor, character: char) -> bool {
+    profiling::function_scope!();
+    if matches!(character, ')' | ']' | '}' | '"') {
+        let document = editor_document_mut(editor);
+        let all_already_closed = !document.insertion_points.is_empty()
+            && document.insertion_points.iter().all(|&position| {
+                position < buffer_len(&document.buffer)
+                    && buffer_byte(&document.buffer, position) == character as u8
+            });
+        if all_already_closed {
+            for position in &mut document.insertion_points {
+                *position = buffer_next_char(&document.buffer, *position);
+            }
+            return true;
+        }
+    }
+    let closing = match character {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' => '"',
+        _ => '\0',
+    };
+    if closing != '\0' {
+        let pair = [character as u8, closing as u8];
+        let document = editor_document_mut(editor);
+        let temp = idno_std::mem().scratch().temp();
+        let mut replacements = temp.vec(document.insertion_points.len());
+        for &position in &document.insertion_points {
+            replacements.push(Replacement {
+                start: position,
+                end: position,
+                inserted: 0..2,
+            });
+        }
+        document_replace_ranges(document, &mut replacements, &pair, None);
+        for position in &mut document.insertion_points {
+            *position = position.saturating_sub(1);
+        }
+        return true;
+    }
+    false
+}
+
+fn editor_refresh_completion(editor: &mut Editor) {
+    profiling::function_scope!();
+    if editor.mode != Mode::Insert
+        || editor_document(editor)
+            .path
+            .as_deref()
+            .and_then(std::path::Path::extension)
+            .and_then(std::ffi::OsStr::to_str)
+            != Some("rs")
+    {
+        editor.completion = None;
+        return;
+    }
+    let insertion_point = editor_document(editor)
+        .insertion_points
+        .last()
+        .copied()
+        .unwrap_or(editor_document(editor).cursor);
+    let mut completion = editor.completion.take().unwrap_or(Completion {
+        matches: Vec::with_capacity(32),
+        selected: 0,
+        prefix_start: insertion_point,
+    });
+    let prefix_start = rust_method_complete(
+        &editor_document(editor).buffer,
+        insertion_point,
+        &editor.rust_methods.corpus,
+        &mut completion.matches,
+    );
+    let Some(prefix_start) = prefix_start else {
+        return;
+    };
+    if completion.matches.is_empty() {
+        return;
+    }
+    completion.prefix_start = prefix_start;
+    completion.selected = completion
+        .selected
+        .min(completion.matches.len().saturating_sub(1));
+    editor.completion = Some(completion);
+}
+
+fn editor_accept_completion(editor: &mut Editor) {
+    profiling::function_scope!();
+    let Some(completion) = editor.completion.take() else {
+        return;
+    };
+    let Some(found) = completion.matches.get(completion.selected) else {
+        return;
+    };
+    let temp = idno_std::mem().scratch().temp();
+    let name = rust_method_name(&editor.rust_methods.corpus, found.item);
+    let mut inserted = temp.vec(name.len());
+    inserted.extend_from_slice(name.as_bytes());
+    let document = editor_document_mut(editor);
+    let primary = document
+        .insertion_points
+        .last()
+        .copied()
+        .unwrap_or(document.cursor);
+    let prefix_length = primary.saturating_sub(completion.prefix_start);
+    let mut replacements = temp.vec(document.insertion_points.len());
+    for &position in &document.insertion_points {
+        replacements.push(Replacement {
+            start: position.saturating_sub(prefix_length),
+            end: position,
+            inserted: 0..inserted.len(),
+        });
+    }
+    document_replace_ranges(document, &mut replacements, &inserted, None);
 }
 
 fn editor_enter_insert(editor: &mut Editor, after: bool) {
@@ -2367,6 +3469,230 @@ fn editor_remove_primary_selection(editor: &mut Editor) {
     document.anchor = primary.anchor;
 }
 
+fn editor_yank(editor: &mut Editor) {
+    profiling::function_scope!();
+    let document = editor_document(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    let mut bytes = temp.vec(1024);
+    let mut values = temp.vec(selections.len());
+    for selection in selections {
+        let start = selection.anchor.min(selection.cursor);
+        let end = buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor));
+        let value_start = bytes.len();
+        buffer_append_range(&document.buffer, start, end, &mut bytes);
+        let value_end = bytes.len();
+        if value_end <= u32::MAX as usize {
+            values.push(value_start as u32..value_end as u32);
+        }
+    }
+    editor.register.bytes.clear();
+    editor.register.bytes.extend_from_slice(&bytes);
+    editor.register.values.clear();
+    editor.register.values.extend(values);
+    write!(
+        &mut editor.status,
+        "yanked {} selection(s)",
+        editor.register.values.len()
+    )
+    .unwrap();
+}
+
+fn editor_paste_register(editor: &mut Editor, after: bool) {
+    profiling::function_scope!();
+    if editor.register.values.is_empty() {
+        editor.status.push_str("register is empty");
+        return;
+    }
+    let temp = idno_std::mem().scratch().temp();
+    let mut bytes = temp.vec(editor.register.bytes.len());
+    bytes.extend_from_slice(&editor.register.bytes);
+    let mut values = temp.vec(editor.register.values.len());
+    values.extend(editor.register.values.iter().cloned());
+    editor_paste_values(editor, &bytes, &values, after);
+}
+
+fn editor_paste_values(
+    editor: &mut Editor,
+    bytes: &[u8],
+    values: &[std::ops::Range<u32>],
+    after: bool,
+) {
+    profiling::function_scope!();
+    if bytes.is_empty() || values.is_empty() {
+        return;
+    }
+    if values
+        .iter()
+        .any(|value| value.start > value.end || value.end as usize > bytes.len())
+    {
+        editor.status.push_str("invalid paste register");
+        return;
+    }
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    let mut replacements = temp.vec(selections.len());
+    for (selection_index, selection) in selections.iter().enumerate() {
+        let position = if after {
+            buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor))
+        } else {
+            selection.anchor.min(selection.cursor)
+        };
+        let value = values[selection_index % values.len()].clone();
+        replacements.push(Replacement {
+            start: position,
+            end: position,
+            inserted: value.start as usize..value.end as usize,
+        });
+    }
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    let mut pasted = temp.vec(replacements.len());
+    for replacement in &replacements {
+        let start = offset_after_replacements(replacement.start, false, &replacements);
+        let end = start + replacement.inserted.len();
+        let mut last_character = replacement.inserted.end.saturating_sub(1);
+        while last_character > replacement.inserted.start
+            && bytes[last_character] & 0b1100_0000 == 0b1000_0000
+        {
+            last_character -= 1;
+        }
+        pasted.push(SelectionState {
+            anchor: start,
+            cursor: if end > start {
+                start + last_character - replacement.inserted.start
+            } else {
+                start
+            },
+        });
+    }
+    document_replace_ranges(document, &mut replacements, bytes, Some(&pasted));
+}
+
+fn editor_yank_system(editor: &mut Editor) {
+    profiling::function_scope!();
+    editor_yank(editor);
+    if let Some(task) = editor.clipboard_copy_task.take() {
+        task.cancel();
+    }
+    let bytes = editor.register.bytes.clone();
+    editor.clipboard_copy_task =
+        Some(idno_std::threads().spawn_owned(move || clipboard_write(&bytes)));
+    editor.status.clear();
+    editor.status.push_str("copying to system clipboard");
+}
+
+fn editor_paste_system(editor: &mut Editor) {
+    profiling::function_scope!();
+    if let Some(task) = editor.clipboard_paste_task.take() {
+        task.cancel();
+    }
+    editor.clipboard_paste_task = Some(idno_std::threads().spawn_owned(clipboard_read));
+    editor.status.push_str("reading system clipboard");
+}
+
+fn editor_poll_clipboard(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let copy_complete = editor
+        .clipboard_copy_task
+        .as_ref()
+        .is_some_and(idno_std::micropool::OwnedTask::complete);
+    if copy_complete && let Some(task) = editor.clipboard_copy_task.take() {
+        match task.try_join() {
+            Ok(true) => editor.status.push_str("copied to system clipboard"),
+            Ok(false) => editor.status.push_str("system clipboard unavailable"),
+            Err(task) => editor.clipboard_copy_task = Some(task),
+        }
+        return true;
+    }
+    let paste_complete = editor
+        .clipboard_paste_task
+        .as_ref()
+        .is_some_and(idno_std::micropool::OwnedTask::complete);
+    if !paste_complete {
+        return false;
+    }
+    let Some(task) = editor.clipboard_paste_task.take() else {
+        return false;
+    };
+    let paste = match task.try_join() {
+        Ok(paste) => paste,
+        Err(task) => {
+            editor.clipboard_paste_task = Some(task);
+            return false;
+        }
+    };
+    if !paste.available {
+        editor.status.push_str("system clipboard unavailable");
+        return true;
+    }
+    if paste.bytes.len() > u32::MAX as usize {
+        editor.status.push_str("system clipboard is too large");
+        return true;
+    }
+    let range = 0..paste.bytes.len() as u32;
+    editor_paste_values(editor, &paste.bytes, std::slice::from_ref(&range), true);
+    true
+}
+
+fn clipboard_write(bytes: &[u8]) -> bool {
+    profiling::function_scope!();
+    let commands: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (program, arguments) in commands {
+        let child = std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            continue;
+        };
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut input| input.write_all(bytes).is_ok());
+        let succeeded = child.wait().is_ok_and(|status| status.success());
+        if written && succeeded {
+            return true;
+        }
+    }
+    false
+}
+
+fn clipboard_read() -> ClipboardPaste {
+    profiling::function_scope!();
+    let commands: [(&str, &[&str]); 3] = [
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-out"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    for (program, arguments) in commands {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            return ClipboardPaste {
+                bytes: output.stdout,
+                available: true,
+            };
+        }
+    }
+    ClipboardPaste {
+        bytes: Vec::new(),
+        available: false,
+    }
+}
+
 fn editor_select_lines(editor: &mut Editor) {
     let document = editor_document_mut(editor);
     let length = buffer_len(&document.buffer);
@@ -2474,7 +3800,11 @@ fn editor_insert_newline(editor: &mut Editor) {
     let mut replacements = temp.vec(document.insertion_points.len());
     let mut inserted_bytes = temp.vec(document.insertion_points.len() * (indentation_spaces + 1));
     let mut indentation = temp.vec(indentation_spaces);
+    let mut outer_indentation = temp.vec(indentation_spaces);
+    let mut original_points = temp.vec(document.insertion_points.len());
+    let mut cursor_offsets = temp.vec(document.insertion_points.len());
     for &position in &document.insertion_points {
+        original_points.push(position);
         indentation.clear();
         if auto_indentation {
             indentation_for_position(
@@ -2486,8 +3816,32 @@ fn editor_insert_newline(editor: &mut Editor) {
             );
         }
         let inserted_start = inserted_bytes.len();
+        let paired = position > 0
+            && position < buffer_len(&document.buffer)
+            && matches!(
+                (
+                    buffer_byte(&document.buffer, position - 1),
+                    buffer_byte(&document.buffer, position)
+                ),
+                (b'(', b')') | (b'[', b']') | (b'{', b'}')
+            );
         inserted_bytes.push(b'\n');
         inserted_bytes.extend_from_slice(&indentation);
+        cursor_offsets.push(1 + indentation.len());
+        if paired {
+            outer_indentation.clear();
+            if auto_indentation {
+                indentation_for_position(
+                    &document.buffer,
+                    position,
+                    false,
+                    indentation_spaces,
+                    &mut outer_indentation,
+                );
+            }
+            inserted_bytes.push(b'\n');
+            inserted_bytes.extend_from_slice(&outer_indentation);
+        }
         replacements.push(Replacement {
             start: position,
             end: position,
@@ -2495,6 +3849,12 @@ fn editor_insert_newline(editor: &mut Editor) {
         });
     }
     document_replace_ranges(document, &mut replacements, &inserted_bytes, None);
+    document.insertion_points.clear();
+    for (&position, &cursor_offset) in original_points.iter().zip(&cursor_offsets) {
+        document
+            .insertion_points
+            .push(offset_after_replacements(position, false, &replacements) + cursor_offset);
+    }
 }
 
 fn editor_open_line_below(editor: &mut Editor) {
@@ -2538,7 +3898,23 @@ fn editor_open_line_below(editor: &mut Editor) {
             inserted: inserted_start..inserted_bytes.len(),
         });
     }
-    document_replace_ranges(document, &mut replacements, &inserted_bytes, None);
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    replacements.dedup_by(|right, left| right.start == left.start && right.end == left.end);
+    let mut after = temp.vec(document.insertion_points.len());
+    let mut transformed_insertion_points = temp.vec(document.insertion_points.len());
+    for &position in &document.insertion_points {
+        let position = offset_after_replacements(position, true, &replacements);
+        transformed_insertion_points.push(position);
+        after.push(SelectionState {
+            cursor: position,
+            anchor: position,
+        });
+    }
+    document_replace_ranges(document, &mut replacements, &inserted_bytes, Some(&after));
+    document.insertion_points.clear();
+    document
+        .insertion_points
+        .extend_from_slice(&transformed_insertion_points);
     editor.mode = Mode::Insert;
 }
 
@@ -2579,11 +3955,55 @@ fn editor_open_line_above(editor: &mut Editor) {
             inserted: inserted_start..inserted_bytes.len(),
         });
     }
-    document_replace_ranges(document, &mut replacements, &inserted_bytes, None);
-    for position in &mut document.insertion_points {
-        *position = position.saturating_sub(1);
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    replacements.dedup_by(|right, left| right.start == left.start && right.end == left.end);
+    let mut after = temp.vec(document.insertion_points.len());
+    let mut transformed_insertion_points = temp.vec(document.insertion_points.len());
+    for &position in &document.insertion_points {
+        let position = offset_after_replacements(position, true, &replacements).saturating_sub(1);
+        transformed_insertion_points.push(position);
+        after.push(SelectionState {
+            cursor: position,
+            anchor: position,
+        });
     }
+    document_replace_ranges(document, &mut replacements, &inserted_bytes, Some(&after));
+    document.insertion_points.clear();
+    document
+        .insertion_points
+        .extend_from_slice(&transformed_insertion_points);
     editor.mode = Mode::Insert;
+}
+
+fn editor_insert_blank_lines(editor: &mut Editor, below: bool) {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    let mut replacements = temp.vec(selections.len());
+    for selection in &selections {
+        let position = if below {
+            buffer_line_end(&document.buffer, selection.cursor)
+        } else {
+            buffer_line_start(&document.buffer, selection.cursor)
+        };
+        replacements.push(Replacement {
+            start: position,
+            end: position,
+            inserted: 0..1,
+        });
+    }
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    replacements.dedup_by_key(|replacement| replacement.start);
+    let mut after = temp.vec(selections.len());
+    for selection in selections {
+        after.push(SelectionState {
+            cursor: offset_after_replacements(selection.cursor, true, &replacements),
+            anchor: offset_after_replacements(selection.anchor, true, &replacements),
+        });
+    }
+    document_replace_ranges(document, &mut replacements, b"\n", Some(&after));
 }
 
 fn editor_move_insert_points_horizontal(editor: &mut Editor, forward: bool) {
@@ -2674,7 +4094,159 @@ fn editor_select_surrounding(editor: &mut Editor, delimiter: char, inside: bool)
         };
     }
     document_set_selections(document, &selections);
-    editor.mode = Mode::Select;
+}
+
+#[derive(Clone, Copy)]
+struct FunctionRange {
+    start: usize,
+    open: usize,
+    close: usize,
+}
+
+fn editor_select_enclosing_function(editor: &mut Editor, inside: bool) {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    code_index_step(
+        &document.buffer,
+        &mut document.code_index,
+        usize::MAX,
+        std::time::Duration::from_millis(2),
+    );
+    let temp = idno_std::mem().scratch().temp();
+    let mut functions = temp.vec(64);
+    rust_function_ranges(document, &mut functions);
+    let target = functions
+        .iter()
+        .filter(|function| function.start <= document.cursor && document.cursor <= function.close)
+        .max_by_key(|function| function.close - function.start)
+        .copied();
+    let Some(target) = target else {
+        editor.status.push_str("no enclosing function");
+        return;
+    };
+    let (start, end) = if inside {
+        (buffer_next_char(&document.buffer, target.open), target.close)
+    } else {
+        (target.start, buffer_next_char(&document.buffer, target.close))
+    };
+    editor_set_symbol_selection(editor, start, end);
+}
+
+fn editor_goto_function(editor: &mut Editor, forward: bool) {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    code_index_step(
+        &document.buffer,
+        &mut document.code_index,
+        usize::MAX,
+        std::time::Duration::from_millis(2),
+    );
+    let temp = idno_std::mem().scratch().temp();
+    let mut functions = temp.vec(64);
+    rust_function_ranges(document, &mut functions);
+    if functions.is_empty() {
+        editor.status.push_str("no functions");
+        return;
+    }
+    functions.sort_unstable_by_key(|function| function.start);
+    let cursor = document.cursor;
+    let target = if forward {
+        functions
+            .iter()
+            .find(|function| function.start > cursor)
+            .unwrap_or(&functions[0])
+    } else {
+        functions
+            .iter()
+            .rev()
+            .find(|function| function.start < cursor)
+            .unwrap_or(&functions[functions.len() - 1])
+    };
+    let start = target.start;
+    let end = buffer_next_char(&document.buffer, target.close);
+    editor_select_symbol(editor, start, end);
+}
+
+fn rust_function_ranges(document: &Document, result: &mut Vec<FunctionRange, impl Allocator>) {
+    profiling::function_scope!();
+    result.clear();
+    for symbol in &document.code_index.symbols {
+        if symbol.kind != crate::code_index::CodeSymbolKind::Function {
+            continue;
+        }
+        let identifier = document.code_index.identifiers[symbol.identifier as usize];
+        let mut open = identifier.end as usize;
+        while open < buffer_len(&document.buffer)
+            && !matches!(buffer_byte(&document.buffer, open), b'{' | b';')
+        {
+            open += 1;
+        }
+        if open >= buffer_len(&document.buffer) || buffer_byte(&document.buffer, open) != b'{' {
+            continue;
+        }
+        let Some(close) = rust_matching_body_brace(&document.buffer, open) else {
+            continue;
+        };
+        let line_start = buffer_line_start(&document.buffer, identifier.start as usize);
+        let mut start = line_start;
+        while start < identifier.start as usize
+            && matches!(buffer_byte(&document.buffer, start), b' ' | b'\t')
+        {
+            start += 1;
+        }
+        result.push(FunctionRange { start, open, close });
+    }
+}
+
+fn rust_matching_body_brace(buffer: &GapBuffer, open: usize) -> Option<usize> {
+    let length = buffer_len(buffer);
+    let mut position = open + 1;
+    let mut depth = 0usize;
+    let mut string = 0u8;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_depth = 0usize;
+    while position < length {
+        let byte = buffer_byte(buffer, position);
+        let next = (position + 1 < length).then(|| buffer_byte(buffer, position + 1));
+        if line_comment {
+            line_comment = byte != b'\n';
+        } else if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                position += 1;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                position += 1;
+            }
+        } else if string != 0 {
+            if byte == b'\\' && !escaped {
+                escaped = true;
+            } else {
+                if byte == string && !escaped {
+                    string = 0;
+                }
+                escaped = false;
+            }
+        } else if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            position += 1;
+        } else if byte == b'/' && next == Some(b'*') {
+            block_depth = 1;
+            position += 1;
+        } else if matches!(byte, b'\'' | b'"') {
+            string = byte;
+        } else if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            if depth == 0 {
+                return Some(position);
+            }
+            depth -= 1;
+        }
+        position += 1;
+    }
+    None
 }
 
 fn delimiter_pair(delimiter: u8) -> (u8, u8) {
@@ -2802,6 +4374,343 @@ fn editor_goto_file_start(editor: &mut Editor) {
     editor_goto_absolute_position(editor, 0);
 }
 
+fn editor_goto_line(editor: &mut Editor, line: usize) {
+    profiling::function_scope!();
+    let document = editor_document(editor);
+    let position = buffer_position_at_line_column(&document.buffer, line, 0);
+    editor_goto_absolute_position(editor, position);
+}
+
+fn editor_goto_git_change(editor: &mut Editor, forward: bool) {
+    profiling::function_scope!();
+    let target = {
+        let document = editor_document(editor);
+        let line = buffer_line_and_column(&document.buffer, document.cursor).0;
+        git_gutter_next_change(&document.git_gutter, line, forward)
+    };
+    let Some(target) = target else {
+        editor.status.push_str("no Git changes");
+        return;
+    };
+    editor_goto_line(editor, target);
+}
+
+fn editor_goto_definition(editor: &mut Editor) {
+    profiling::function_scope!();
+    let temp = idno_std::mem().scratch().temp();
+    let mut name = temp.vec(64);
+    let local_target = {
+        let document = editor_document_mut(editor);
+        code_index_step(
+            &document.buffer,
+            &mut document.code_index,
+            256 * 1024,
+            std::time::Duration::from_micros(500),
+        );
+        let Some(identifier) = code_index_identifier_at(&document.code_index, document.cursor)
+        else {
+            editor.status.push_str("no indexed identifier");
+            return;
+        };
+        let identifier_range = document.code_index.identifiers[identifier];
+        for position in identifier_range.start as usize..identifier_range.end as usize {
+            name.push(buffer_byte(&document.buffer, position));
+        }
+        code_index_definition_for(&document.buffer, &document.code_index, identifier).map(
+            |symbol| {
+                let symbol = document.code_index.symbols[symbol];
+                let identifier = document.code_index.identifiers[symbol.identifier as usize];
+                (
+                    identifier.start as usize,
+                    identifier.end as usize,
+                    symbol.kind,
+                )
+            },
+        )
+    };
+    if local_target.is_some_and(|(_, _, kind)| kind == crate::code_index::CodeSymbolKind::Module)
+        && editor_goto_module_file(editor, &name)
+    {
+        return;
+    }
+    if let Some((start, end, _)) = local_target {
+        editor_select_symbol(editor, start, end);
+        return;
+    }
+    let method = {
+        let document = editor_document(editor);
+        rust_method_definition(
+            &document.buffer,
+            document.cursor,
+            &editor.rust_methods.corpus,
+        )
+    };
+    if let Some(method) = method {
+        let definition = editor.rust_methods.corpus.methods[method];
+        let Some(path) = rust_method_path(&editor.rust_methods.corpus, method) else {
+            return;
+        };
+        let path = path.to_path_buf();
+        editor_navigate_to_symbol(
+            editor,
+            &path,
+            definition.position as usize,
+            definition.end as usize,
+        );
+        return;
+    }
+    if editor_goto_workspace_symbol(editor, &name) {
+        return;
+    }
+    if editor_goto_indexed_rust_symbol(editor, &name) {
+        return;
+    }
+    editor.status.push_str("definition not indexed");
+}
+
+fn editor_goto_indexed_rust_symbol(editor: &mut Editor, name: &[u8]) -> bool {
+    profiling::function_scope!();
+    let symbol = editor
+        .rust_methods
+        .corpus
+        .symbols
+        .iter()
+        .enumerate()
+        .find_map(|(index, symbol)| {
+            let candidate = &editor.rust_methods.corpus.bytes
+                [symbol.name_start as usize..symbol.name_end as usize];
+            (candidate == name).then_some(index)
+        });
+    let Some(symbol) = symbol else {
+        return false;
+    };
+    let definition = editor.rust_methods.corpus.symbols[symbol];
+    let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+        return false;
+    };
+    let path = path.to_path_buf();
+    editor_navigate_to_symbol(
+        editor,
+        &path,
+        definition.position as usize,
+        definition.end as usize,
+    );
+    true
+}
+
+fn editor_goto_module_file(editor: &mut Editor, name: &[u8]) -> bool {
+    profiling::function_scope!();
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let Some(parent) = editor_document(editor)
+        .path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    else {
+        return false;
+    };
+    let direct = parent.join(format!("{name}.rs"));
+    let nested = parent.join(name).join("mod.rs");
+    let path = if direct.is_file() {
+        direct
+    } else if nested.is_file() {
+        nested
+    } else {
+        return false;
+    };
+    editor_navigate_to_symbol(editor, &path, 0, 0);
+    true
+}
+
+fn editor_goto_workspace_symbol(editor: &mut Editor, name: &[u8]) -> bool {
+    profiling::function_scope!();
+    let target = editor.project_search.as_ref().and_then(|corpus| {
+        corpus.lines.iter().find_map(|line| {
+            let project_file = line.project_file as usize;
+            if project_file >= editor.project.labels.len()
+                || !editor.project.labels[project_file].ends_with(".rs")
+            {
+                return None;
+            }
+            let source = &corpus.bytes[line.text_start as usize..line.display_end as usize];
+            let Some((start, end)) = rust_symbol_name_range(source) else {
+                return None;
+            };
+            (source[start..end] == *name).then_some((
+                project_file,
+                line.file_offset as usize + start,
+                line.file_offset as usize + end,
+            ))
+        })
+    });
+    let Some((project_file, start, end)) = target else {
+        return false;
+    };
+    let Some(path) = editor.project.paths.get(project_file).cloned() else {
+        return false;
+    };
+    editor_navigate_to_symbol(editor, &path, start, end);
+    true
+}
+
+fn editor_select_references(editor: &mut Editor) {
+    profiling::function_scope!();
+    let temp = idno_std::mem().scratch().temp();
+    let mut name = temp.vec(64);
+    {
+        let document = editor_document_mut(editor);
+        code_index_step(
+            &document.buffer,
+            &mut document.code_index,
+            256 * 1024,
+            std::time::Duration::from_micros(500),
+        );
+        let Some(identifier) = code_index_identifier_at(&document.code_index, document.cursor)
+        else {
+            editor.status.push_str("no indexed identifier");
+            return;
+        };
+        let identifier = document.code_index.identifiers[identifier];
+        for position in identifier.start as usize..identifier.end as usize {
+            name.push(buffer_byte(&document.buffer, position));
+        }
+    }
+    editor_open_picker(editor, PickerKind::References);
+    let mut picker = editor.picker.take().unwrap();
+    reference_targets_collect(editor, &name, &mut picker);
+    if picker.reference_targets.is_empty() {
+        editor.status.push_str("no references indexed");
+        return;
+    }
+    picker_refresh(editor, &mut picker);
+    editor.picker = Some(picker);
+}
+
+fn reference_targets_collect(editor: &Editor, name: &[u8], picker: &mut Picker) {
+    profiling::function_scope!();
+    let document = editor_document(editor);
+    let current_project_file = document.path.as_ref().and_then(|path| {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        editor.project.paths.iter().position(|candidate| {
+            std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone()) == path
+        })
+    });
+    let length = buffer_len(&document.buffer);
+    let mut line_start = 0;
+    let mut line_number = 1;
+    while line_start <= length {
+        let line_end = buffer_line_end(&document.buffer, line_start);
+        let mut position = line_start;
+        while position + name.len() <= line_end {
+            if buffer_range_matches_identifier(&document.buffer, position, line_end, name) {
+                let label_start = picker.symbol_corpus.bytes.len();
+                write!(&mut picker.symbol_corpus.bytes, "{line_number}: ").unwrap();
+                buffer_append_range(
+                    &document.buffer,
+                    line_start,
+                    line_end,
+                    &mut picker.symbol_corpus.bytes,
+                );
+                reference_target_push(
+                    picker,
+                    u32::MAX,
+                    position,
+                    position + name.len(),
+                    label_start,
+                );
+            }
+            position += 1;
+        }
+        if line_end >= length {
+            break;
+        }
+        line_start = line_end + 1;
+        line_number += 1;
+    }
+    let Some(corpus) = editor.project_search.as_ref() else {
+        return;
+    };
+    for line in &corpus.lines {
+        let project_file = line.project_file as usize;
+        if current_project_file == Some(project_file) {
+            continue;
+        }
+        let source = &corpus.bytes[line.text_start as usize..line.display_end as usize];
+        let mut position = 0;
+        while position + name.len() <= source.len() {
+            if slice_range_matches_identifier(source, position, name) {
+                let label_start = picker.symbol_corpus.bytes.len();
+                picker.symbol_corpus.bytes.extend_from_slice(
+                    &corpus.bytes[line.display_start as usize..line.display_end as usize],
+                );
+                reference_target_push(
+                    picker,
+                    line.project_file,
+                    line.file_offset as usize + position,
+                    line.file_offset as usize + position + name.len(),
+                    label_start,
+                );
+            }
+            position += 1;
+        }
+    }
+}
+
+fn reference_target_push(
+    picker: &mut Picker,
+    project_file: u32,
+    start: usize,
+    end: usize,
+    label_start: usize,
+) {
+    if end > u32::MAX as usize || picker.symbol_corpus.bytes.len() > u32::MAX as usize {
+        picker.symbol_corpus.bytes.truncate(label_start);
+        return;
+    }
+    let label_end = picker.symbol_corpus.bytes.len();
+    picker.symbol_corpus.lines.push(SearchLine {
+        project_file,
+        file_offset: start as u32,
+        text_start: label_start as u32,
+        display_start: label_start as u32,
+        display_end: label_end as u32,
+    });
+    picker.reference_targets.push(ReferenceTarget {
+        project_file,
+        start: start as u32,
+        end: end as u32,
+    });
+}
+
+fn buffer_range_matches_identifier(
+    buffer: &GapBuffer,
+    start: usize,
+    line_end: usize,
+    name: &[u8],
+) -> bool {
+    let before = start == 0 || !rust_identifier_byte(buffer_byte(buffer, start - 1));
+    let end = start + name.len();
+    before
+        && (end >= line_end || !rust_identifier_byte(buffer_byte(buffer, end)))
+        && name
+            .iter()
+            .enumerate()
+            .all(|(offset, &byte)| buffer_byte(buffer, start + offset) == byte)
+}
+
+fn slice_range_matches_identifier(source: &[u8], start: usize, name: &[u8]) -> bool {
+    let end = start + name.len();
+    (start == 0 || !rust_identifier_byte(source[start - 1]))
+        && (end == source.len() || !rust_identifier_byte(source[end]))
+        && source.get(start..end) == Some(name)
+}
+
+#[inline]
+fn rust_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn editor_goto_last_line(editor: &mut Editor) {
     let document = editor_document(editor);
     let length = buffer_len(&document.buffer);
@@ -2832,6 +4741,46 @@ fn editor_goto_absolute_position(editor: &mut Editor, position: usize) {
         document.anchor = position;
     }
     document.preferred_column = buffer_line_and_column(&document.buffer, position).1;
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
+}
+
+fn editor_select_symbol(editor: &mut Editor, start: usize, end: usize) {
+    profiling::function_scope!();
+    let before = editor_location(editor);
+    editor_set_symbol_selection(editor, start, end);
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
+}
+
+fn editor_set_symbol_selection(editor: &mut Editor, start: usize, end: usize) {
+    let document = editor_document_mut(editor);
+    let start = start.min(buffer_len(&document.buffer));
+    let end = end.min(buffer_len(&document.buffer));
+    document.cursor = start;
+    document.anchor = if end > start {
+        buffer_previous_char(&document.buffer, end)
+    } else {
+        start
+    };
+    document.secondary_selections.clear();
+    document.preferred_column = buffer_line_and_column(&document.buffer, start).1;
+    editor.mode = Mode::Normal;
+}
+
+fn editor_navigate_to_symbol(
+    editor: &mut Editor,
+    path: &std::path::Path,
+    start: usize,
+    end: usize,
+) {
+    profiling::function_scope!();
+    let before = editor_location(editor);
+    let Some(target) = editor_document_target(editor, path.to_path_buf()) else {
+        return;
+    };
+    editor_switch_document_state(editor, target);
+    editor_set_symbol_selection(editor, start, end);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
 }
@@ -2918,10 +4867,21 @@ fn command_cursor_clamped(buffer: &GapBuffer, mut cursor: usize, mode: Mode) -> 
 
 fn editor_render(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Result<()> {
     let (width, height) = terminal::terminal_size(terminal);
-    if editor.picker.is_some() {
+    let picker = editor.picker.is_some();
+    let force = width != editor.terminal_width
+        || height != editor.terminal_height
+        || picker != editor.rendered_picker
+        || editor.theme != editor.rendered_theme;
+    editor.terminal_width = width;
+    editor.terminal_height = height;
+    editor.rendered_picker = picker;
+    editor.rendered_theme = editor.theme;
+    if picker {
+        editor.rendered_row_hashes.clear();
+        editor.rendered_overlay_start = None;
         return editor_render_picker(editor, terminal, width, height);
     }
-    editor_render_document(editor, terminal, width, height)
+    editor_render_document(editor, terminal, width, height, force)
 }
 
 fn editor_render_document(
@@ -2929,6 +4889,7 @@ fn editor_render_document(
     terminal: &mut Terminal,
     width: usize,
     height: usize,
+    force: bool,
 ) -> std::io::Result<()> {
     profiling::function_scope!();
     let theme = &THEMES[editor.theme];
@@ -2973,6 +4934,7 @@ fn editor_render_document(
     let text_width = width.saturating_sub(gutter_width);
     let temp = idno_std::mem().scratch().temp();
     let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    let mut row_ranges = temp.vec(content_height);
     document_selections(document, &mut selections);
     let path = document
         .path
@@ -2981,11 +4943,15 @@ fn editor_render_document(
     let dirty = document.modified;
 
     editor.frame.clear();
-    editor.frame.extend_from_slice(b"\x1b[?25l\x1b[H");
+    editor
+        .frame
+        .extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[H");
     editor.frame.extend_from_slice(theme.cursor_color);
     editor.frame.extend_from_slice(theme.normal);
-    editor.frame.extend_from_slice(b"\x1b[2J");
     let mut position = buffer_position_at_line_column(&document.buffer, top_line, 0);
+    let syntax_spans = syntax_highlighting_spans(&document.syntax);
+    let mut syntax_span_position =
+        syntax_spans.partition_point(|span| span.end as usize <= position);
     let length = buffer_len(&document.buffer);
     let end_line = buffer_line_and_column(&document.buffer, length).0;
     let trailing_empty_line = length > 0 && buffer_byte(&document.buffer, length - 1) == b'\n';
@@ -2996,12 +4962,26 @@ fn editor_render_document(
     };
     let mut rendered_style = 0u8;
     for row in 0..content_height {
+        let row_start = editor.frame.len();
         let line = top_line + row;
         editor.frame.extend_from_slice(theme.gutter);
         if line < total_lines && !(trailing_empty_line && line + 1 == total_lines) {
-            write!(&mut editor.frame, "{:>number_width$} ", line + 1).unwrap();
+            write!(&mut editor.frame, "{:>number_width$}", line + 1).unwrap();
         } else {
-            write!(&mut editor.frame, "{:>number_width$} ", "~").unwrap();
+            write!(&mut editor.frame, "{:>number_width$}", "~").unwrap();
+        }
+        let git_flags = git_gutter_flags(&document.git_gutter, line);
+        if git_gutter_line_removed(git_flags) {
+            editor.frame.extend_from_slice(theme.git_removed);
+            editor.frame.extend_from_slice("╴".as_bytes());
+        } else if git_gutter_line_modified(git_flags) {
+            editor.frame.extend_from_slice(theme.git_modified);
+            editor.frame.extend_from_slice("▎".as_bytes());
+        } else if git_gutter_line_added(git_flags) {
+            editor.frame.extend_from_slice(theme.git_added);
+            editor.frame.extend_from_slice("▎".as_bytes());
+        } else {
+            editor.frame.push(b' ');
         }
         editor.frame.extend_from_slice(theme.normal);
         let mut column = 0;
@@ -3009,14 +4989,30 @@ fn editor_render_document(
             && buffer_byte(&document.buffer, position) != b'\n'
             && column < text_width
         {
+            while syntax_span_position < syntax_spans.len()
+                && syntax_spans[syntax_span_position].end as usize <= position
+            {
+                syntax_span_position += 1;
+            }
+            let syntax_style = syntax_spans
+                .get(syntax_span_position)
+                .filter(|span| span.start as usize <= position && position < span.end as usize)
+                .map(|span| 4 + span.kind as u8);
             let secondary_insert_cursor = secondary_insertion_points.contains(&position);
             let normal_cursor = search.is_none()
                 && mode != Mode::Insert
                 && selections
                     .iter()
                     .any(|selection| selection.cursor == position);
-            let position_selected =
-                search.is_none() && position_is_selected(&document.buffer, &selections, position);
+            let position_selected = search.is_none()
+                && selections.iter().any(|selection| {
+                    (mode != Mode::Insert || selection.anchor != selection.cursor)
+                        && position_is_selected(
+                            &document.buffer,
+                            std::slice::from_ref(selection),
+                            position,
+                        )
+                });
             let position_search_scope = search.is_some_and(|search| {
                 search.kind == SearchKind::Selection
                     && position_is_selected(&document.buffer, &search.original_selections, position)
@@ -3041,15 +5037,17 @@ fn editor_render_document(
             } else if position_search_scope {
                 1
             } else {
-                0
+                syntax_style.unwrap_or(0)
             };
             if wanted_style != rendered_style {
-                editor.frame.extend_from_slice(match wanted_style {
+                let style = match wanted_style {
                     3 => theme.cursor,
                     2 => theme.selection,
                     1 => theme.search_scope,
+                    4.. => theme.syntax[(wanted_style - 4) as usize],
                     _ => theme.normal,
-                });
+                };
+                editor.frame.extend_from_slice(style);
                 rendered_style = wanted_style;
             }
             let byte = buffer_byte(&document.buffer, position);
@@ -3130,11 +5128,13 @@ fn editor_render_document(
         }
         editor.frame.extend_from_slice(theme.normal);
         editor.frame.extend_from_slice(b"\x1b[K");
+        row_ranges.push(row_start..editor.frame.len());
         rendered_style = 0;
         if row + 1 < content_height {
             editor.frame.extend_from_slice(b"\r\n");
         }
     }
+    let status_start = editor.frame.len();
     editor.frame.extend_from_slice(theme.status);
     editor.frame.extend_from_slice(b"\x1b[");
     write!(&mut editor.frame, "{};1H", height).unwrap();
@@ -3165,8 +5165,8 @@ fn editor_render_document(
             cursor_column + 1
         )
         .unwrap();
-        if editor.pending_key != PendingKey::None {
-            write!(&mut editor.frame, " {:?}", editor.pending_key).unwrap();
+        if editor.pending_key == PendingKey::Goto && editor.pending_count > 0 {
+            write!(&mut editor.frame, " g{}", editor.pending_count).unwrap();
         }
         if !editor.status.is_empty() {
             write!(&mut editor.frame, " {}", editor.status).unwrap();
@@ -3174,6 +5174,90 @@ fn editor_render_document(
     }
     editor.frame.extend_from_slice(b"\x1b[K");
     editor.frame.extend_from_slice(theme.normal);
+    let key_hints = pending_key_hints(editor.pending_key);
+    if !key_hints.is_empty() && width > 0 && content_height > 0 {
+        let visible_hints = key_hints.len().min(content_height);
+        let key_width = key_hints
+            .iter()
+            .take(visible_hints)
+            .map(|hint| hint.key.len())
+            .max()
+            .unwrap_or(0);
+        let popup_width = key_hints
+            .iter()
+            .take(visible_hints)
+            .map(|hint| key_width + 3 + hint.description.len())
+            .max()
+            .unwrap_or(0)
+            .min(width);
+        let popup_column = width.saturating_sub(popup_width) + 1;
+        let popup_row = content_height.saturating_sub(visible_hints) + 1;
+        for (row, hint) in key_hints.iter().take(visible_hints).enumerate() {
+            write!(
+                &mut editor.frame,
+                "\x1b[{};{}H",
+                popup_row + row,
+                popup_column
+            )
+            .unwrap();
+            editor.frame.extend_from_slice(theme.status);
+            write!(
+                &mut editor.frame,
+                " {:<key_width$}  {:<description_width$}",
+                hint.key,
+                hint.description,
+                description_width = popup_width.saturating_sub(key_width + 3)
+            )
+            .unwrap();
+        }
+        editor.frame.extend_from_slice(theme.normal);
+    }
+    if key_hints.is_empty()
+        && let Some(completion) = editor.completion.as_ref()
+        && width > 0
+        && content_height > 0
+    {
+        let visible = completion.matches.len().min(8).min(content_height);
+        let first = completion
+            .selected
+            .saturating_sub(visible.saturating_sub(1));
+        let popup_width = completion.matches[first..first + visible]
+            .iter()
+            .map(|found| rust_method_name(&editor.rust_methods.corpus, found.item).len() + 2)
+            .max()
+            .unwrap_or(0)
+            .min(width);
+        let popup_column = width.saturating_sub(popup_width) + 1;
+        let popup_row = content_height.saturating_sub(visible) + 1;
+        for (row, found) in completion.matches[first..first + visible]
+            .iter()
+            .enumerate()
+        {
+            write!(
+                &mut editor.frame,
+                "\x1b[{};{}H",
+                popup_row + row,
+                popup_column
+            )
+            .unwrap();
+            editor
+                .frame
+                .extend_from_slice(if first + row == completion.selected {
+                    theme.picker_selected
+                } else {
+                    theme.status
+                });
+            let name = rust_method_name(&editor.rust_methods.corpus, found.item);
+            write!(
+                &mut editor.frame,
+                " {:<name_width$} ",
+                name,
+                name_width = popup_width.saturating_sub(2)
+            )
+            .unwrap();
+        }
+        editor.frame.extend_from_slice(theme.normal);
+    }
     let screen_row = cursor_line.saturating_sub(top_line) + 1;
     let screen_column = (gutter_width + cursor_column).min(width.saturating_sub(1)) + 1;
     if let Some(search) = search {
@@ -3193,7 +5277,78 @@ fn editor_render_document(
         )
         .unwrap();
     }
-    terminal::terminal_present(terminal, &editor.frame)
+    let overlay_start = if !key_hints.is_empty() {
+        Some(content_height.saturating_sub(key_hints.len().min(content_height)))
+    } else {
+        editor.completion.as_ref().map(|completion| {
+            content_height.saturating_sub(completion.matches.len().min(8).min(content_height))
+        })
+    };
+    editor.frame.extend_from_slice(b"\x1b[?2026l");
+    editor_present_document_rows(
+        editor,
+        terminal,
+        &row_ranges,
+        status_start,
+        overlay_start,
+        force,
+    )
+}
+
+fn editor_present_document_rows(
+    editor: &mut Editor,
+    terminal: &mut Terminal,
+    row_ranges: &[std::ops::Range<usize>],
+    status_start: usize,
+    overlay_start: Option<usize>,
+    force: bool,
+) -> std::io::Result<()> {
+    profiling::function_scope!();
+    let dirty_overlay_start = match (editor.rendered_overlay_start, overlay_start) {
+        (Some(previous), Some(current)) => Some(previous.min(current)),
+        (Some(previous), None) => Some(previous),
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+    };
+    editor.rendered_overlay_start = overlay_start;
+    let size_changed = editor.rendered_row_hashes.len() != row_ranges.len();
+    if force || size_changed {
+        editor.rendered_row_hashes.clear();
+        editor.rendered_row_hashes.reserve(row_ranges.len());
+        for range in row_ranges {
+            editor
+                .rendered_row_hashes
+                .push(render_bytes_hash(&editor.frame[range.clone()]));
+        }
+        return terminal::terminal_present(terminal, &editor.frame);
+    }
+    editor.present_frame.clear();
+    editor
+        .present_frame
+        .extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+    for (row, range) in row_ranges.iter().enumerate() {
+        let hash = render_bytes_hash(&editor.frame[range.clone()]);
+        let overlay_dirty = dirty_overlay_start.is_some_and(|start| row >= start);
+        if hash != editor.rendered_row_hashes[row] || overlay_dirty {
+            write!(&mut editor.present_frame, "\x1b[{};1H", row + 1).unwrap();
+            editor
+                .present_frame
+                .extend_from_slice(&editor.frame[range.clone()]);
+        }
+        editor.rendered_row_hashes[row] = hash;
+    }
+    editor
+        .present_frame
+        .extend_from_slice(&editor.frame[status_start..]);
+    terminal::terminal_present(terminal, &editor.present_frame)
+}
+
+fn render_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn editor_render_picker(
@@ -3209,12 +5364,16 @@ fn editor_render_picker(
         PickerKind::Files => "files",
         PickerKind::Commands => "commands",
         PickerKind::SearchProject => "search project",
+        PickerKind::DocumentSymbols => "document symbols",
+        PickerKind::WorkspaceSymbols => "workspace symbols",
+        PickerKind::References => "references",
     };
     editor.frame.clear();
-    editor.frame.extend_from_slice(b"\x1b[?25l\x1b[H");
+    editor
+        .frame
+        .extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[H");
     editor.frame.extend_from_slice(theme.cursor_color);
     editor.frame.extend_from_slice(theme.normal);
-    editor.frame.extend_from_slice(b"\x1b[2J");
     let match_count = if picker.kind == PickerKind::Files && picker.query.is_empty() {
         editor.project.labels.len()
     } else {
@@ -3291,6 +5450,28 @@ fn editor_render_picker(
                     )
                     .unwrap_or("")
                 }
+                PickerKind::DocumentSymbols => {
+                    let line = picker.symbol_corpus.lines[picker.symbol_candidates[item]];
+                    std::str::from_utf8(
+                        &picker.symbol_corpus.bytes
+                            [line.display_start as usize..line.display_end as usize],
+                    )
+                    .unwrap_or("")
+                }
+                PickerKind::WorkspaceSymbols => {
+                    let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
+                        continue;
+                    };
+                    rust_symbol_name(&editor.rust_methods.corpus, symbol)
+                }
+                PickerKind::References => {
+                    let line = picker.symbol_corpus.lines[item];
+                    std::str::from_utf8(
+                        &picker.symbol_corpus.bytes
+                            [line.display_start as usize..line.display_end as usize],
+                    )
+                    .unwrap_or("")
+                }
             };
             let mut end = label.len().min(width.saturating_sub(2));
             while !label.is_char_boundary(end) {
@@ -3315,6 +5496,7 @@ fn editor_render_picker(
         height, query_column
     )
     .unwrap();
+    editor.frame.extend_from_slice(b"\x1b[?2026l");
     terminal::terminal_present(terminal, &editor.frame)
 }
 
@@ -3386,6 +5568,136 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_file_indexes_its_parent_for_the_file_picker() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-parent-picker-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let readme = directory.join("README.md");
+        std::fs::write(&readme, b"readme").unwrap();
+        std::fs::write(directory.join("main.rs"), b"fn main() {}").unwrap();
+
+        let mut editor = editor_open(Some(readme)).unwrap();
+        editor_handle_key(&mut editor, Key::Character(' '));
+        editor_handle_key(&mut editor, Key::Character('f'));
+        assert!(editor.project.labels.iter().any(|label| label == "main.rs"));
+        assert_eq!(
+            editor.project.root,
+            std::fs::canonicalize(&directory).unwrap()
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reload_replaces_modified_content_and_is_undoable() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-reload-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("reload.txt");
+        std::fs::write(&path, b"disk").unwrap();
+        let mut editor = editor_open(Some(path.clone())).unwrap();
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('x'));
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(contents(&editor), b"xdisk");
+        std::fs::write(&path, b"fresh").unwrap();
+
+        editor_execute_command(&mut editor, "reload");
+        assert_eq!(contents(&editor), b"fresh");
+        assert!(!editor_document(&editor).modified);
+        editor_handle_key(&mut editor, Key::Character('u'));
+        assert_eq!(contents(&editor), b"xdisk");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn goto_module_definition_opens_the_module_file() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-module-definition-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let main = directory.join("main.rs");
+        let module = directory.join("potato.rs");
+        std::fs::write(&main, b"mod potato;\nfn main() { grow(); }").unwrap();
+        std::fs::write(&module, b"pub fn grow() {}").unwrap();
+        let mut editor = editor_open(Some(main)).unwrap();
+        editor.documents[0].cursor = 4;
+        editor.documents[0].anchor = 4;
+        for key in ['g', 'd'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            editor_document(&editor)
+                .path
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("potato.rs")
+        );
+
+        editor_switch_document(&mut editor, 0);
+        editor.documents[0].cursor = 24;
+        editor.documents[0].anchor = 24;
+        for key in ['g', 'd'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            editor_document(&editor)
+                .path
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str),
+            Some("potato.rs")
+        );
+        assert_eq!(
+            (
+                editor_document(&editor).cursor,
+                editor_document(&editor).anchor
+            ),
+            (7, 10)
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_partial_key_state_has_described_continuations() {
+        for pending in [
+            PendingKey::Space,
+            PendingKey::SpaceTheme,
+            PendingKey::Goto,
+            PendingKey::Match,
+            PendingKey::MatchAround,
+            PendingKey::MatchInside,
+            PendingKey::InsertLineAbove,
+            PendingKey::InsertLineBelow,
+        ] {
+            let hints = pending_key_hints(pending);
+            assert!(!hints.is_empty(), "missing hints for {pending:?}");
+            assert!(
+                hints
+                    .iter()
+                    .all(|hint| !hint.key.is_empty() && !hint.description.is_empty())
+            );
+        }
+    }
+
+    #[test]
     fn secondary_cursor_edits_and_undo_are_one_batch() {
         let mut editor = editor_with_text("a\nb\n");
         editor_handle_key(&mut editor, Key::Character('C'));
@@ -3435,8 +5747,18 @@ mod tests {
                 editor_document(&editor).anchor,
                 editor_document(&editor).cursor
             ),
-            (0, 4)
+            (4, 0)
         );
+    }
+
+    #[test]
+    fn insert_exit_uses_the_final_insert_head() {
+        let mut editor = editor_with_text("abcd");
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Right);
+        editor_handle_key(&mut editor, Key::Right);
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(editor_document(&editor).cursor, 2);
     }
 
     #[test]
@@ -3450,11 +5772,148 @@ mod tests {
     }
 
     #[test]
+    fn yank_and_paste_use_internal_multi_value_register() {
+        let mut editor = editor_with_text("a\nb\n");
+        editor_handle_key(&mut editor, Key::Character('C'));
+        editor_handle_key(&mut editor, Key::Character('y'));
+        assert_eq!(editor.register.values, [0..1, 1..2]);
+        assert_eq!(editor.register.bytes, b"ab");
+        editor_handle_key(&mut editor, Key::Character('p'));
+        assert_eq!(contents(&editor), b"aa\nbb\n");
+        assert_eq!(editor_document(&editor).secondary_selections.len(), 1);
+    }
+
+    #[test]
     fn enter_copies_indentation_and_indents_open_scopes() {
         let mut editor = editor_with_text("    {");
         editor_handle_key(&mut editor, Key::Character('A'));
         editor_handle_key(&mut editor, Key::Enter);
         assert_eq!(contents(&editor), b"    {\n        ");
+    }
+
+    #[test]
+    fn auto_pairs_and_paired_enter_keep_the_cursor_inside() {
+        let mut editor = editor_with_text("");
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('{'));
+        assert_eq!(contents(&editor), b"{}");
+        assert_eq!(editor_document(&editor).insertion_points, [1]);
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(contents(&editor), b"{\n    \n}");
+        assert_eq!(editor_document(&editor).insertion_points, [6]);
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(contents(&editor), b"{\n\n}");
+        assert_eq!(editor_document(&editor).cursor, 2);
+        assert_eq!(editor_document(&editor).anchor, 2);
+    }
+
+    #[test]
+    fn collapsed_insert_does_not_create_or_expand_a_selection() {
+        let mut editor = editor_with_text("word");
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('x'));
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (1, 1)
+        );
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (0, 0)
+        );
+
+        editor_handle_key(&mut editor, Key::Character('o'));
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (6, 6)
+        );
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (6, 6)
+        );
+    }
+
+    #[test]
+    fn backspace_removes_untouched_auto_pair_closers() {
+        let mut editor = editor_with_text("");
+        editor_handle_key(&mut editor, Key::Character('i'));
+        for character in ['[', '(', '{'] {
+            editor_handle_key(&mut editor, Key::Character(character));
+        }
+        assert_eq!(contents(&editor), b"[({})]");
+        for _ in 0..3 {
+            editor_handle_key(&mut editor, Key::Backspace);
+        }
+        assert_eq!(contents(&editor), b"");
+    }
+
+    #[test]
+    fn backspace_treats_complete_space_indentation_units_like_tabs() {
+        let mut editor = editor_with_text("        value\n   value");
+        editor.documents[0].cursor = 8;
+        editor.documents[0].anchor = 8;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Backspace);
+        assert_eq!(contents(&editor), b"    value\n   value");
+        assert_eq!(editor_document(&editor).insertion_points, [4]);
+        editor_handle_key(&mut editor, Key::Escape);
+
+        editor.documents[0].cursor = 13;
+        editor.documents[0].anchor = 13;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Backspace);
+        assert_eq!(contents(&editor), b"    value\n  value");
+    }
+
+    #[test]
+    fn escape_removes_unused_auto_indentation_from_open_line() {
+        let mut editor = editor_with_text("    item");
+        editor_handle_key(&mut editor, Key::Character('o'));
+        assert_eq!(contents(&editor), b"    item\n    ");
+        editor_handle_key(&mut editor, Key::Escape);
+        assert_eq!(contents(&editor), b"    item\n");
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (9, 9)
+        );
+        editor_handle_key(&mut editor, Key::Character('u'));
+        assert_eq!(contents(&editor), b"    item");
+    }
+
+    #[test]
+    fn bracket_space_inserts_blank_lines_without_moving_selection() {
+        let mut editor = editor_with_text("one\ntwo");
+        editor.documents[0].cursor = 4;
+        editor.documents[0].anchor = 4;
+        for key in ['[', ' '] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(contents(&editor), b"one\n\ntwo");
+        assert_eq!(editor_document(&editor).cursor, 5);
+        assert_eq!(editor_document(&editor).anchor, 5);
+
+        for key in [']', ' '] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(contents(&editor), b"one\n\ntwo\n");
+        assert_eq!(editor_document(&editor).cursor, 5);
+        assert_eq!(editor_document(&editor).anchor, 5);
     }
 
     #[test]
@@ -3472,6 +5931,7 @@ mod tests {
             ),
             (5, 7)
         );
+        assert_eq!(editor.mode, Mode::Normal);
         for key in ['m', 'a', '('] {
             editor_handle_key(&mut editor, Key::Character(key));
         }
@@ -3482,6 +5942,7 @@ mod tests {
             ),
             (4, 8)
         );
+        assert_eq!(editor.mode, Mode::Normal);
     }
 
     #[test]
@@ -3538,6 +5999,30 @@ mod tests {
     }
 
     #[test]
+    fn counted_goto_uses_one_based_line_numbers() {
+        let mut source = String::new();
+        for line in 1..=120 {
+            writeln!(&mut source, "line {line}").unwrap();
+        }
+        let mut editor = editor_with_text(&source);
+        for key in ['g', '1', '0', '0', 'g'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            buffer_line_and_column(
+                &editor_document(&editor).buffer,
+                editor_document(&editor).cursor
+            )
+            .0,
+            99
+        );
+        for key in ['g', 'g'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor_document(&editor).cursor, 0);
+    }
+
+    #[test]
     fn goto_last_accessed_document_toggles_documents() {
         let mut editor = editor_with_text("first");
         let mut second = document_empty();
@@ -3555,6 +6040,84 @@ mod tests {
             editor_handle_key(&mut editor, Key::Character(key));
         }
         assert_eq!(editor.current, 1);
+    }
+
+    #[test]
+    fn rust_definition_and_reference_bindings_use_local_index() {
+        let mut editor = editor_with_text("let value = 1; value + value");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        editor.documents[0].cursor = 15;
+        editor.documents[0].anchor = 15;
+        for key in ['g', 'd'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor_document(&editor).cursor, 4);
+
+        editor.documents[0].cursor = 15;
+        editor.documents[0].anchor = 15;
+        for key in ['g', 'r'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor_document(&editor).secondary_selections.len(), 2);
+    }
+
+    #[test]
+    fn explicit_type_member_completion_accepts_with_tab() {
+        let mut editor = editor_with_text("let potato: Vec<usize>; potato.p");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .bytes
+            .extend_from_slice(b"Vecpush");
+        editor
+            .rust_methods
+            .corpus
+            .methods
+            .push(crate::rust_methods::RustMethod {
+                owner_start: 0,
+                owner_end: 3,
+                name_start: 3,
+                name_end: 7,
+            });
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].cursor = end;
+        editor.documents[0].anchor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('u'));
+        assert_eq!(
+            editor
+                .completion
+                .as_ref()
+                .map(|completion| completion.matches.len()),
+            Some(1)
+        );
+        editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(contents(&editor), b"let potato: Vec<usize>; potato.push");
+    }
+
+    #[test]
+    fn document_symbol_picker_selects_name_with_cursor_at_start() {
+        let mut editor = editor_with_text("fn alpha() {}\n");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        editor_handle_key(&mut editor, Key::Character(' '));
+        editor_handle_key(&mut editor, Key::Character('s'));
+        assert_eq!(
+            editor.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::DocumentSymbols)
+        );
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(
+            (
+                editor_document(&editor).cursor,
+                editor_document(&editor).anchor
+            ),
+            (3, 7)
+        );
     }
 
     #[test]
@@ -3624,10 +6187,10 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_search_in_document_selects_the_matching_span() {
+    fn exact_search_in_document_selects_the_matching_span() {
         let mut editor = editor_with_text("alpha\nimportant needle here\nomega\n");
         editor_handle_key(&mut editor, Key::Character('/'));
-        for character in "nede".chars() {
+        for character in "needle".chars() {
             editor_handle_key(&mut editor, Key::Character(character));
         }
         assert_eq!(editor.search.as_ref().unwrap().matches.len(), 1);
@@ -3642,6 +6205,17 @@ mod tests {
     }
 
     #[test]
+    fn document_search_does_not_correct_or_skip_query_bytes() {
+        let mut editor = editor_with_text("needle n_e_e_d_l_e nede needle");
+        editor_handle_key(&mut editor, Key::Character('/'));
+        for character in "nede".chars() {
+            editor_handle_key(&mut editor, Key::Character(character));
+        }
+        assert_eq!(editor.search.as_ref().unwrap().matches.len(), 1);
+        assert_eq!(editor.search.as_ref().unwrap().matches[0].anchor, 19);
+    }
+
+    #[test]
     fn document_search_stays_in_place_and_escape_cancels() {
         let mut editor = editor_with_text("one needle two");
         editor.documents[0].cursor = 4;
@@ -3649,7 +6223,7 @@ mod tests {
         editor_handle_key(&mut editor, Key::Character('/'));
         assert!(editor.picker.is_none());
         assert!(editor.search.is_some());
-        for character in "nedl".chars() {
+        for character in "needle".chars() {
             editor_handle_key(&mut editor, Key::Character(character));
         }
         assert_eq!(editor.search.as_ref().unwrap().matches.len(), 1);
@@ -3760,5 +6334,34 @@ mod tests {
         let picker = editor.picker.as_ref().unwrap();
         assert_eq!(picker.matches.len(), 2048);
         assert_eq!(picker.search_scan_position, 5000);
+    }
+
+    #[test]
+    fn accepted_global_search_selects_the_whole_matching_line() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-global-line-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("main.rs");
+        std::fs::write(&path, b"before\nline needle here\nafter\n").unwrap();
+        let mut editor = editor_open(Some(path)).unwrap();
+        editor_handle_key(&mut editor, Key::Character(' '));
+        editor_handle_key(&mut editor, Key::Character('/'));
+        for character in "needle".chars() {
+            editor_handle_key(&mut editor, Key::Character(character));
+        }
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (7, 23)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

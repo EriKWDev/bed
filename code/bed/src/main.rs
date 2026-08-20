@@ -2,9 +2,13 @@
 #![feature(allocator_api)]
 
 mod buffer;
+mod code_index;
 mod editor;
 mod fuzzy;
+mod git;
 mod project;
+mod rust_methods;
+mod syntax;
 mod terminal;
 
 #[global_allocator]

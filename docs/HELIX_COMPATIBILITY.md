@@ -20,7 +20,11 @@ exhaustive inventories.
   line selection, word movement, line boundaries, goto prefix, match objects,
   multiple cursors, insertion on adjacent lines, undo/redo transactions, and
   jump-list traversal.
-- File picker on `Space f`, in-place current-buffer fuzzy search on `/`,
+- Clean adjacent-line insertion with automatic indentation cleanup, default-on
+  bracket/quote pairing, paired-scope Enter indentation, and non-moving blank
+  lines on `[Space`/`]Space`. Collapsed insert sessions remain collapsed and
+  Backspace removes untouched paired closers.
+- File picker on `Space f`, in-place contiguous smart-case search on `/`,
   project-wide fuzzy content search on `Space /`, next/previous accepted search
   results on `n`/`N`, and in-selection occurrence search on `s`.
 - Command palette with command-token completion and argument-aware theme/file
@@ -31,6 +35,22 @@ exhaustive inventories.
   write-quit-all aliases.
 - Theme command and five built-in color themes, with Kanagawa as the default and
   the configured `Space t` shortcuts.
+- Bottom-right continuation hints for every implemented multi-key prefix.
+- One-based `g<number>g`, `gg`, and previous/next Git-change traversal on
+  `[g`/`]g`, backed by a nonblocking minimal Git gutter.
+- Extension-selected resumable syntax highlighting for TOML, Markdown, Rust,
+  C, C++, Go, Nim, and Odin, including structured comment annotations and
+  separate control/declaration/constant/operator classes; local Rust `gd`
+  definition lookup and `gr` reference selection over the
+  incomplete-source-tolerant flat symbol index.
+- Document/workspace symbol palettes on `Space s`/`Space S` and explicit-type
+  Rust member completion using an asynchronously built compact method index for
+  workspace and active-toolchain standard-library sources.
+- Internal multi-value yank/paste on `y`, `p`, and `P`; asynchronous system
+  clipboard yank/paste on `Space Y`/`Space P`; undoable `:reload` from disk.
+- Helix-style word/punctuation/whitespace boundaries for `w` and `b`, module
+  file and workspace-symbol definition fallback, whole-line global-search
+  acceptance, and identifier-selecting symbol palette acceptance.
 
 ## Next audit groups
 

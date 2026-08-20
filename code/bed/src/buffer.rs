@@ -100,14 +100,17 @@ pub fn buffer_previous_char(buffer: &GapBuffer, position: usize) -> usize {
 pub fn buffer_next_word_start(buffer: &GapBuffer, position: usize) -> usize {
     let length = buffer_len(buffer);
     let mut position = position.min(length);
-    if position < length && byte_starts_word(buffer_byte(buffer, position)) {
-        while position < length && byte_starts_word(buffer_byte(buffer, position)) {
-            position = buffer_next_char(buffer, position);
-        }
-    } else if position < length {
+    if position >= length {
+        return position;
+    }
+    let category = byte_word_category(buffer_byte(buffer, position));
+    position = buffer_next_char(buffer, position);
+    while position < length && byte_word_category(buffer_byte(buffer, position)) == category {
         position = buffer_next_char(buffer, position);
     }
-    while position < length && !byte_starts_word(buffer_byte(buffer, position)) {
+    while position < length
+        && byte_word_category(buffer_byte(buffer, position)) == WordCategory::Whitespace
+    {
         position = buffer_next_char(buffer, position);
     }
     position
@@ -115,15 +118,19 @@ pub fn buffer_next_word_start(buffer: &GapBuffer, position: usize) -> usize {
 
 pub fn buffer_previous_word_start(buffer: &GapBuffer, position: usize) -> usize {
     let mut position = position.min(buffer_len(buffer));
-    while position > 0 {
-        position = buffer_previous_char(buffer, position);
-        if byte_starts_word(buffer_byte(buffer, position)) {
-            break;
-        }
+    if position == 0 {
+        return 0;
     }
+    position = buffer_previous_char(buffer, position);
+    while position > 0
+        && byte_word_category(buffer_byte(buffer, position)) == WordCategory::Whitespace
+    {
+        position = buffer_previous_char(buffer, position);
+    }
+    let category = byte_word_category(buffer_byte(buffer, position));
     while position > 0 {
         let previous = buffer_previous_char(buffer, position);
-        if !byte_starts_word(buffer_byte(buffer, previous)) {
+        if byte_word_category(buffer_byte(buffer, previous)) != category {
             break;
         }
         position = previous;
@@ -131,9 +138,24 @@ pub fn buffer_previous_word_start(buffer: &GapBuffer, position: usize) -> usize 
     position
 }
 
-#[inline]
-fn byte_starts_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordCategory {
+    Word,
+    Whitespace,
+    EndOfLine,
+    Punctuation,
+}
+
+fn byte_word_category(byte: u8) -> WordCategory {
+    if matches!(byte, b'\n' | b'\r') {
+        WordCategory::EndOfLine
+    } else if byte.is_ascii_whitespace() {
+        WordCategory::Whitespace
+    } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
+        WordCategory::Word
+    } else {
+        WordCategory::Punctuation
+    }
 }
 
 pub fn buffer_line_start(buffer: &GapBuffer, position: usize) -> usize {
@@ -251,5 +273,15 @@ mod tests {
         }
         assert_eq!(positions, [0, 1, 3, 7]);
         assert_eq!(buffer_previous_char(&buffer, 7), 3);
+    }
+
+    #[test]
+    fn word_motions_stop_at_helix_punctuation_boundaries() {
+        let buffer = buffer_from_bytes(b"alpha({beta}) gamma");
+        assert_eq!(buffer_next_word_start(&buffer, 0), 5);
+        assert_eq!(buffer_next_word_start(&buffer, 5), 7);
+        assert_eq!(buffer_next_word_start(&buffer, 7), 11);
+        assert_eq!(buffer_previous_word_start(&buffer, 13), 11);
+        assert_eq!(buffer_previous_word_start(&buffer, 11), 7);
     }
 }
