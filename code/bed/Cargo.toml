@@ -1,0 +1,12 @@
+[package]
+name = "bed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitfield.workspace = true
+idno_std.workspace = true
+libc = "0.2"
+mimalloc.workspace = true
+micropool.workspace = true
+profiling.workspace = true
