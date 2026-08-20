@@ -201,17 +201,66 @@ fn code_index_identifier(
     });
     let followed_by_field_colon = code_next_nonwhitespace(buffer, end, length) == Some(b':')
         && !code_bytes_equal(buffer, end, b"::");
-    if let Some(kind) = index.expected_symbol.take() {
+    if index.expected_symbol == Some(CodeSymbolKind::Value)
+        && buffer_byte(buffer, start).is_ascii_uppercase()
+        && code_next_nonwhitespace(buffer, end, length) == Some(b'(')
+    {
+        return;
+    }
+    let kind = index.expected_symbol.take().or_else(|| {
+        (code_identifier_is_match_binding(buffer, start, end, length) || followed_by_field_colon)
+            .then_some(CodeSymbolKind::Value)
+    });
+    if let Some(kind) = kind {
         index.symbols.push(CodeSymbol {
             identifier: identifier as u32,
             kind,
         });
-    } else if followed_by_field_colon {
-        index.symbols.push(CodeSymbol {
-            identifier: identifier as u32,
-            kind: CodeSymbolKind::Value,
-        });
     }
+}
+
+fn code_identifier_is_match_binding(
+    buffer: &GapBuffer,
+    start: usize,
+    end: usize,
+    length: usize,
+) -> bool {
+    if !buffer_byte(buffer, start).is_ascii_lowercase() && buffer_byte(buffer, start) != b'_' {
+        return false;
+    }
+    let mut arm_start = start;
+    while arm_start > 0 {
+        let byte = buffer_byte(buffer, arm_start - 1);
+        if matches!(byte, b'\n' | b';' | b'{' | b',') {
+            break;
+        }
+        arm_start -= 1;
+    }
+    let mut before = arm_start;
+    while before + 2 <= start {
+        if code_range_equal(buffer, before, before + 2, b"if") {
+            let mut after_if = before + 2;
+            while after_if < start && buffer_byte(buffer, after_if).is_ascii_whitespace() {
+                after_if += 1;
+            }
+            if !code_bytes_equal(buffer, after_if, b"let") {
+                return false;
+            }
+        }
+        before += 1;
+    }
+    let mut position = end;
+    while position < length {
+        let byte = buffer_byte(buffer, position);
+        if byte == b'=' && position + 1 < length && buffer_byte(buffer, position + 1) == b'>' {
+            return true;
+        }
+        if matches!(byte, b'\n' | b';' | b'{' | b',') {
+            return false;
+        }
+        position += 1;
+    }
+    false
 }
 
 fn code_index_scan_block_comment(buffer: &GapBuffer, index: &mut CodeIndex, length: usize) {
@@ -258,18 +307,48 @@ pub fn code_index_definition_for(
     index: &CodeIndex,
     identifier: usize,
 ) -> Option<usize> {
+    code_index_definition_for_kind(buffer, index, identifier, None)
+}
+
+pub fn code_index_definition_of_kind(
+    buffer: &GapBuffer,
+    index: &CodeIndex,
+    identifier: usize,
+    kind: CodeSymbolKind,
+) -> Option<usize> {
+    code_index_definition_for_kind(buffer, index, identifier, Some(kind))
+}
+
+fn code_index_definition_for_kind(
+    buffer: &GapBuffer,
+    index: &CodeIndex,
+    identifier: usize,
+    required_kind: Option<CodeSymbolKind>,
+) -> Option<usize> {
     profiling::function_scope!();
     let Some(identifier) = index.identifiers.get(identifier).copied() else {
         return None;
     };
+    let self_reference = code_range_equal(
+        buffer,
+        identifier.start as usize,
+        identifier.end as usize,
+        b"Self",
+    );
     let mut best = None;
     for (symbol_index, symbol) in index.symbols.iter().enumerate() {
+        if required_kind.is_some_and(|kind| symbol.kind != kind) {
+            continue;
+        }
         let Some(candidate) = index.identifiers.get(symbol.identifier as usize) else {
             continue;
         };
-        if candidate.scope_depth > identifier.scope_depth
-            || !code_ranges_equal(buffer, identifier, *candidate)
-        {
+        let matching_definition = if self_reference {
+            symbol.kind == CodeSymbolKind::Type
+        } else {
+            code_ranges_equal(buffer, identifier, *candidate)
+        };
+        if candidate.scope_depth > identifier.scope_depth || !matching_definition {
             continue;
         }
         let before = candidate.start <= identifier.start;
@@ -346,7 +425,6 @@ fn code_rust_keyword(buffer: &GapBuffer, start: usize, end: usize) -> bool {
         b"ref",
         b"return",
         b"self",
-        b"Self",
         b"super",
         b"true",
         b"unsafe",
@@ -431,6 +509,64 @@ mod tests {
     }
 
     #[test]
+    fn mutable_local_resolves_inside_a_multiline_call() {
+        let source = br#"fn open() {
+    let mut document = document_empty();
+    code_index_step(
+        &document.buffer,
+        &mut document.code_index,
+        256 * 1024,
+        std::time::Duration::from_millis(1),
+    );
+}"#;
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        code_index_set_path(&mut index, Some(std::path::Path::new("editor.rs")));
+        while !index.complete {
+            code_index_step(&buffer, &mut index, 32, std::time::Duration::MAX);
+        }
+        for use_position in source
+            .windows(b"&document".len())
+            .enumerate()
+            .filter_map(|(position, word)| (word == b"&document").then_some(position + 1))
+        {
+            let identifier = code_index_identifier_at(&index, use_position).unwrap();
+            let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+            let definition = index.identifiers[index.symbols[definition].identifier as usize];
+            assert_eq!(
+                &source[definition.start as usize..definition.end as usize],
+                b"document"
+            );
+            assert_eq!(definition.start, 24);
+        }
+    }
+
+    #[test]
+    fn large_file_function_use_resolves_to_its_same_file_declaration() {
+        let source = include_bytes!("editor.rs");
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        code_index_set_path(&mut index, Some(std::path::Path::new("editor.rs")));
+        while !index.complete {
+            code_index_step(&buffer, &mut index, 128 * 1024, std::time::Duration::MAX);
+        }
+        let needle = b"| editor_step_project_search(editor)";
+        let use_position = source
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap()
+            + 2;
+        let identifier = code_index_identifier_at(&index, use_position).unwrap();
+        let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+        let definition = index.identifiers[index.symbols[definition].identifier as usize];
+        assert_eq!(
+            &source[definition.start as usize..definition.end as usize],
+            b"editor_step_project_search"
+        );
+        assert_ne!(definition.start, use_position as u32);
+    }
+
+    #[test]
     fn lifetimes_do_not_hide_following_constant_definitions() {
         let source = b"type Borrowed<'a> = &'a str; const LIMIT: usize = 4; LIMIT";
         let buffer = buffer_from_bytes(source);
@@ -444,5 +580,96 @@ mod tests {
         let symbol = index.symbols[definition];
         assert_eq!(symbol.kind, CodeSymbolKind::Constant);
         assert_eq!(index.identifiers[symbol.identifier as usize].start, 35);
+    }
+
+    #[test]
+    fn constructor_patterns_bind_the_inner_value_in_let_and_match_arms() {
+        for source in [
+            b"if let Err(error) = call() { use_value(error); }".as_slice(),
+            b"match call() { Err(error) => return Err(error), _ => {} }",
+        ] {
+            let buffer = buffer_from_bytes(source);
+            let mut index = code_index_empty();
+            index.enabled = true;
+            index.complete = false;
+            code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+            let use_position = source
+                .windows(5)
+                .rposition(|word| word == b"error")
+                .unwrap();
+            let identifier = code_index_identifier_at(&index, use_position).unwrap();
+            let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+            let definition = index.identifiers[index.symbols[definition].identifier as usize];
+            assert!(definition.start < use_position as u32);
+            assert_eq!(
+                &source[definition.start as usize..definition.end as usize],
+                b"error"
+            );
+        }
+    }
+
+    #[test]
+    fn match_guard_uses_resolve_to_the_pattern_binding() {
+        let source = b"match input { Some(path) if path.is_dir() => (path, None), _ => todo!() }";
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        index.enabled = true;
+        index.complete = false;
+        code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        let binding = source.windows(4).position(|word| word == b"path").unwrap();
+        for use_position in source
+            .windows(4)
+            .enumerate()
+            .filter_map(|(position, word)| {
+                (word == b"path" && position != binding).then_some(position)
+            })
+        {
+            let identifier = code_index_identifier_at(&index, use_position).unwrap();
+            let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+            let definition = index.identifiers[index.symbols[definition].identifier as usize];
+            assert_eq!(definition.start as usize, binding);
+        }
+    }
+
+    #[test]
+    fn argument_types_resolve_to_same_file_type_declarations() {
+        let source = b"pub struct Editor {}\npub struct Terminal {}\npub fn editor_run(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Result<()> {}";
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        index.enabled = true;
+        index.complete = false;
+        code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        for name in [b"Editor".as_slice(), b"Terminal"] {
+            let use_position = source
+                .windows(name.len())
+                .rposition(|word| word == name)
+                .unwrap();
+            let declaration = source
+                .windows(name.len())
+                .position(|word| word == name)
+                .unwrap();
+            let identifier = code_index_identifier_at(&index, use_position).unwrap();
+            let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+            let definition = index.identifiers[index.symbols[definition].identifier as usize];
+            assert_eq!(definition.start as usize, declaration);
+        }
+    }
+
+    #[test]
+    fn implicit_self_type_resolves_to_the_enclosing_trait() {
+        let source = b"pub trait DynamicsValue: Copy + Add<Output = Self> {}";
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        index.enabled = true;
+        index.complete = false;
+        code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        let self_position = source.windows(4).position(|word| word == b"Self").unwrap();
+        let identifier = code_index_identifier_at(&index, self_position).unwrap();
+        let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
+        let definition = index.identifiers[index.symbols[definition].identifier as usize];
+        assert_eq!(
+            &source[definition.start as usize..definition.end as usize],
+            b"DynamicsValue"
+        );
     }
 }

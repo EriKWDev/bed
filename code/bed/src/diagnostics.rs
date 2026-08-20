@@ -9,8 +9,11 @@ pub enum DiagnosticSeverity {
 pub struct Diagnostic {
     pub path: std::path::PathBuf,
     pub display: String,
+    pub message_start: u32,
     pub line: u32,
     pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
     pub severity: DiagnosticSeverity,
 }
 
@@ -135,15 +138,19 @@ fn diagnostics_parse_line(
     let Some(primary) = bytes_find(source, b"\"is_primary\":true") else {
         return;
     };
-    let span = &source[..primary];
+    let Some(span) = json_object_containing(source, primary) else {
+        return;
+    };
     let Some(file_key) = bytes_rfind(span, b"\"file_name\":") else {
         return;
     };
-    let Some((file_name, _)) = json_string(source, file_key + b"\"file_name\":".len()) else {
+    let Some((file_name, _)) = json_string(span, file_key + b"\"file_name\":".len()) else {
         return;
     };
     let line = json_u32_after(span, b"\"line_start\":").unwrap_or(1);
     let column = json_u32_after(span, b"\"column_start\":").unwrap_or(1);
+    let end_line = json_u32_after(span, b"\"line_end\":").unwrap_or(line);
+    let end_column = json_u32_after(span, b"\"column_end\":").unwrap_or(column);
     let severity = if bytes_find(source, b"\"level\":\"error\"").is_some() {
         DiagnosticSeverity::Error
     } else if bytes_find(source, b"\"level\":\"warning\"").is_some() {
@@ -168,17 +175,87 @@ fn diagnostics_parse_line(
         DiagnosticSeverity::Warning => "warning",
         DiagnosticSeverity::Info => "info",
     };
-    let display = format!(
-        "{severity_name} {}:{line}:{column} {message}",
+    let mut display = format!(
+        "{severity_name} {}:{line}:{column} ",
         path.strip_prefix(root).unwrap_or(&path).display()
     );
+    let message_start = display.len().min(u32::MAX as usize) as u32;
+    display.push_str(&message);
     diagnostics.push(Diagnostic {
         path,
         display,
+        message_start,
         line: line.saturating_sub(1),
         column: column.saturating_sub(1),
+        end_line: end_line.saturating_sub(1),
+        end_column: end_column.saturating_sub(1),
         severity,
     });
+}
+
+fn json_object_containing(source: &[u8], target: usize) -> Option<&[u8]> {
+    profiling::function_scope!();
+    let mut stack = [0usize; 32];
+    let mut depth = 0usize;
+    let mut position = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    while position <= target.min(source.len().saturating_sub(1)) {
+        let byte = source[position];
+        if string {
+            if byte == b'\\' && !escaped {
+                escaped = true;
+            } else {
+                if byte == b'"' && !escaped {
+                    string = false;
+                }
+                escaped = false;
+            }
+        } else if byte == b'"' {
+            string = true;
+        } else if byte == b'{' {
+            if depth >= stack.len() {
+                return None;
+            }
+            stack[depth] = position;
+            depth += 1;
+        } else if byte == b'}' {
+            depth = depth.saturating_sub(1);
+        }
+        position += 1;
+    }
+    if depth == 0 {
+        return None;
+    }
+    let start = stack[depth - 1];
+    position = start;
+    depth = 0;
+    string = false;
+    escaped = false;
+    while position < source.len() {
+        let byte = source[position];
+        if string {
+            if byte == b'\\' && !escaped {
+                escaped = true;
+            } else {
+                if byte == b'"' && !escaped {
+                    string = false;
+                }
+                escaped = false;
+            }
+        } else if byte == b'"' {
+            string = true;
+        } else if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(&source[start..=position]);
+            }
+        }
+        position += 1;
+    }
+    None
 }
 
 fn json_string(source: &[u8], mut position: usize) -> Option<(String, usize)> {
@@ -251,7 +328,7 @@ mod tests {
 
     #[test]
     fn cargo_json_primary_span_becomes_severity_sorted_diagnostic() {
-        let source = br#"{"reason":"compiler-message","message":{"rendered":"","children":[],"level":"error","message":"mismatched types","spans":[{"file_name":"src/main.rs","line_start":7,"line_end":7,"column_start":9,"column_end":12,"is_primary":true}]}}"#;
+        let source = br#"{"reason":"compiler-message","message":{"rendered":"","children":[],"level":"error","message":"mismatched types","spans":[{"byte_end":40,"byte_start":37,"column_end":12,"column_start":9,"file_name":"src/main.rs","is_primary":true,"label":"wrong type","line_end":7,"line_start":7}]}}"#;
         let mut diagnostics = Vec::new();
         diagnostics_parse_line(std::path::Path::new("/work"), source, &mut diagnostics);
         assert_eq!(diagnostics.len(), 1);
@@ -261,6 +338,14 @@ mod tests {
             std::path::Path::new("/work/src/main.rs")
         );
         assert_eq!((diagnostics[0].line, diagnostics[0].column), (6, 8));
+        assert_eq!(
+            (diagnostics[0].end_line, diagnostics[0].end_column),
+            (6, 11)
+        );
+        assert_eq!(
+            &diagnostics[0].display[diagnostics[0].message_start as usize..],
+            "mismatched types"
+        );
         assert!(diagnostics[0].display.contains("mismatched types"));
     }
 }

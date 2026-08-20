@@ -5,11 +5,13 @@ use std::io::Write as _;
 
 use crate::buffer::*;
 use crate::code_index::{
-    CodeIndex, code_index_definition_for, code_index_empty, code_index_identifier_at,
-    code_index_invalidate, code_index_set_path, code_index_step,
+    CodeIndex, CodeSymbolKind, code_index_definition_for, code_index_definition_of_kind,
+    code_index_empty, code_index_identifier_at, code_index_invalidate, code_index_set_path,
+    code_index_step,
 };
 use crate::diagnostics::{
-    Diagnostics, diagnostics_pending, diagnostics_poll, diagnostics_restart, diagnostics_start,
+    DiagnosticSeverity, Diagnostics, diagnostics_pending, diagnostics_poll, diagnostics_restart,
+    diagnostics_start,
 };
 use crate::fuzzy::{FuzzyMatch, fuzzy_byte_matches, fuzzy_rank};
 use crate::git::{
@@ -22,14 +24,16 @@ use crate::project::{
     ProjectDiscoveryState, ProjectFiles, project_discover, project_discovery_step,
 };
 use crate::rust_methods::{
-    RustMethodIndex, rust_method_complete, rust_method_definition, rust_method_index_empty,
-    rust_method_index_pending, rust_method_index_poll, rust_method_index_start, rust_method_name,
-    rust_method_path, rust_symbol_name, rust_symbol_path,
+    RustMethodCorpus, RustMethodIndex, rust_explicit_type, rust_free_function_complete,
+    rust_method_complete, rust_method_definition, rust_method_detail, rust_method_index_empty,
+    rust_method_index_finish, rust_method_index_pending, rust_method_index_poll,
+    rust_method_index_restart, rust_method_index_start, rust_method_name, rust_method_path,
+    rust_namespace_root, rust_symbol_detail, rust_symbol_name, rust_symbol_owner, rust_symbol_path,
 };
 use crate::syntax::{
-    SYNTAX_KIND_COUNT, SyntaxHighlighting, syntax_highlighting_adjust_edits,
-    syntax_highlighting_empty, syntax_highlighting_invalidate, syntax_highlighting_set_path,
-    syntax_highlighting_spans, syntax_highlighting_step,
+    SYNTAX_KIND_COUNT, SyntaxHighlighting, SyntaxKind, SyntaxSpan,
+    syntax_highlighting_adjust_edits, syntax_highlighting_empty, syntax_highlighting_invalidate,
+    syntax_highlighting_set_path, syntax_highlighting_spans, syntax_highlighting_step,
 };
 use crate::terminal::{self, Key, Terminal};
 
@@ -111,6 +115,9 @@ pub enum PendingKey {
     Match,
     MatchAround,
     MatchInside,
+    MatchSurround,
+    MatchReplaceFrom,
+    MatchReplaceTo(char),
     InsertLineAbove,
     InsertLineBelow,
 }
@@ -151,12 +158,20 @@ const SPACE_KEY_HINTS: &[KeyHint] = &[
         description: "workspace diagnostics",
     },
     KeyHint {
+        key: "a",
+        description: "code actions",
+    },
+    KeyHint {
         key: "Y",
         description: "yank to clipboard",
     },
     KeyHint {
         key: "P",
         description: "paste clipboard after",
+    },
+    KeyHint {
+        key: "R",
+        description: "replace with clipboard",
     },
 ];
 const THEME_KEY_HINTS: &[KeyHint] = &[
@@ -236,6 +251,14 @@ const MATCH_KEY_HINTS: &[KeyHint] = &[
         key: "i",
         description: "select inside",
     },
+    KeyHint {
+        key: "s",
+        description: "surround add",
+    },
+    KeyHint {
+        key: "r",
+        description: "surround replace",
+    },
 ];
 const MATCH_AROUND_KEY_HINTS: &[KeyHint] = &[KeyHint {
     key: "f/<char>",
@@ -244,6 +267,14 @@ const MATCH_AROUND_KEY_HINTS: &[KeyHint] = &[KeyHint {
 const MATCH_INSIDE_KEY_HINTS: &[KeyHint] = &[KeyHint {
     key: "f/<char>",
     description: "select inside delimiter",
+}];
+const MATCH_SURROUND_KEY_HINTS: &[KeyHint] = &[KeyHint {
+    key: "<char>",
+    description: "add surround",
+}];
+const MATCH_REPLACE_KEY_HINTS: &[KeyHint] = &[KeyHint {
+    key: "<char>",
+    description: "choose surround",
 }];
 const INSERT_LINE_KEY_HINTS: &[KeyHint] = &[
     KeyHint {
@@ -262,6 +293,10 @@ const INSERT_LINE_KEY_HINTS: &[KeyHint] = &[
         key: "d",
         description: "diagnostic",
     },
+    KeyHint {
+        key: "a",
+        description: "argument",
+    },
 ];
 
 pub fn pending_key_hints(pending: PendingKey) -> &'static [KeyHint] {
@@ -273,6 +308,8 @@ pub fn pending_key_hints(pending: PendingKey) -> &'static [KeyHint] {
         PendingKey::Match => MATCH_KEY_HINTS,
         PendingKey::MatchAround => MATCH_AROUND_KEY_HINTS,
         PendingKey::MatchInside => MATCH_INSIDE_KEY_HINTS,
+        PendingKey::MatchSurround => MATCH_SURROUND_KEY_HINTS,
+        PendingKey::MatchReplaceFrom | PendingKey::MatchReplaceTo(_) => MATCH_REPLACE_KEY_HINTS,
         PendingKey::InsertLineAbove | PendingKey::InsertLineBelow => INSERT_LINE_KEY_HINTS,
     }
 }
@@ -292,9 +329,38 @@ pub struct EditorConfig {
 }
 
 pub struct Completion {
-    pub matches: Vec<FuzzyMatch>,
+    pub bytes: Vec<u8>,
+    pub matches: Vec<CompletionEntry>,
     pub selected: usize,
     pub prefix_start: usize,
+    pub preview: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CompletionEntry {
+    pub name_start: u32,
+    pub name_end: u32,
+    pub detail_start: u32,
+    pub detail_end: u32,
+    pub insertion_start: u32,
+    pub insertion_end: u32,
+    pub selection_start: u32,
+    pub selection_end: u32,
+    pub replacement_start: usize,
+    pub symbol: u32,
+    pub flags: u8,
+}
+
+const COMPLETION_POSTFIX: u8 = 1 << 0;
+
+struct CompletionCandidate<'a> {
+    name: &'a str,
+    detail: &'a str,
+    insertion: &'a [u8],
+    selection: std::ops::Range<u32>,
+    replacement_start: usize,
+    symbol: u32,
+    flags: u8,
 }
 
 pub struct Register {
@@ -307,11 +373,28 @@ pub struct ClipboardPaste {
     pub available: bool,
 }
 
+pub struct WorkspaceSnapshot {
+    pub project: ProjectFiles,
+    pub fingerprint: u64,
+}
+
+pub struct FormatResult {
+    pub document: usize,
+    pub original: Vec<u8>,
+    pub formatted: Vec<u8>,
+    pub formatter: &'static str,
+    pub success: bool,
+}
+
 pub struct Picker {
     pub kind: PickerKind,
     pub query: String,
     pub matches: Vec<FuzzyMatch>,
     pub selected: usize,
+    pub first_visible: usize,
+    pub tab_cycling: bool,
+    pub original_theme: usize,
+    pub theme_preview: bool,
     pub search_query: String,
     pub search_candidates: Vec<usize>,
     pub search_candidate_position: usize,
@@ -320,10 +403,41 @@ pub struct Picker {
     pub search_seen: Vec<u64>,
     pub search_ranked: Vec<FuzzyMatch>,
     pub symbol_corpus: SearchCorpus,
+    pub preview_corpus: SearchCorpus,
     pub symbol_candidates: Vec<usize>,
     pub rust_symbol_candidates: Vec<usize>,
     pub reference_targets: Vec<ReferenceTarget>,
     pub diagnostic_candidates: Vec<usize>,
+    pub preview: Option<PickerPreviewCache>,
+    pub preview_load_key: Option<PickerPreviewKey>,
+    pub preview_load_task: Option<idno_std::micropool::OwnedTask<PickerPreviewLoad>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PickerPreviewKey {
+    pub kind: PickerKind,
+    pub item: usize,
+}
+
+pub struct PickerPreviewCache {
+    pub key: PickerPreviewKey,
+    pub buffer: GapBuffer,
+    pub syntax: SyntaxHighlighting,
+    pub target_line: usize,
+    pub target_start: usize,
+    pub target_end: usize,
+    pub first_line_number: usize,
+}
+
+pub struct PickerPreviewLoad {
+    pub key: PickerPreviewKey,
+    pub path: std::path::PathBuf,
+    pub bytes: Vec<u8>,
+    pub target_line: usize,
+    pub target_start: usize,
+    pub target_end: usize,
+    pub first_line_number: usize,
+    pub available: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -331,6 +445,15 @@ pub struct ReferenceTarget {
     pub project_file: u32,
     pub start: u32,
     pub end: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct ReferenceDefinition {
+    pub identifier: Option<u32>,
+    pub position: Option<usize>,
+    pub rust_symbol: Option<usize>,
+    pub workspace_symbol: Option<usize>,
+    pub workspace: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -345,6 +468,35 @@ pub struct SearchLine {
 pub struct SearchCorpus {
     pub bytes: Vec<u8>,
     pub lines: Vec<SearchLine>,
+    pub identifiers: Vec<SearchIdentifier>,
+    pub symbols: Vec<SearchSymbol>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SearchSymbol {
+    pub name_start: u32,
+    pub name_end: u32,
+    pub project_file: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct SearchIdentifier {
+    pub name_start: u32,
+    pub name_end: u32,
+    pub project_file: u32,
+    pub file_start: u32,
+    pub file_end: u32,
+    pub line: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PickerPreview<'a> {
+    corpus: &'a SearchCorpus,
+    target: usize,
+    file_start: usize,
+    file_end: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,15 +555,20 @@ pub struct Editor {
     pub project_search: Option<SearchCorpus>,
     pub project_search_task: Option<idno_std::micropool::OwnedTask<SearchCorpus>>,
     pub project_discovery: Option<ProjectDiscoveryState>,
+    pub workspace_refresh_task: Option<idno_std::micropool::OwnedTask<WorkspaceSnapshot>>,
+    pub workspace_fingerprint: u64,
+    pub workspace_refresh_at: std::time::Instant,
     pub rust_methods: RustMethodIndex,
     pub completion: Option<Completion>,
     pub register: Register,
     pub clipboard_copy_task: Option<idno_std::micropool::OwnedTask<bool>>,
     pub clipboard_paste_task: Option<idno_std::micropool::OwnedTask<ClipboardPaste>>,
+    pub clipboard_paste_replaces: bool,
     pub diagnostics: Diagnostics,
+    pub format_task: Option<idno_std::micropool::OwnedTask<FormatResult>>,
 }
 
-const COMMANDS: [&str; 66] = [
+const COMMANDS: &[&str] = &[
     "write",
     "w",
     "write!",
@@ -475,9 +632,17 @@ const COMMANDS: [&str; 66] = [
     "reload-all!",
     "rla",
     "rla!",
+    "format",
     "toggle-auto-indentation",
     "toggle-auto-indent-scopes",
     "toggle-auto-pairs",
+];
+
+const RUST_COMPLETION_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
 ];
 
 pub struct Theme {
@@ -485,8 +650,8 @@ pub struct Theme {
     pub normal: &'static [u8],
     pub gutter: &'static [u8],
     pub status: &'static [u8],
-    pub search_scope: &'static [u8],
-    pub selection: &'static [u8],
+    pub selection_background: &'static [u8],
+    pub preview_line_background: &'static [u8],
     pub cursor: &'static [u8],
     pub syntax: [&'static [u8]; SYNTAX_KIND_COUNT],
     pub git_added: &'static [u8],
@@ -496,7 +661,7 @@ pub struct Theme {
     pub cursor_color: &'static [u8],
 }
 
-const THEME_NAMES: [&str; 5] = [
+const THEME_NAMES: &[&str] = &[
     "kanagawa",
     "bogster",
     "everforest_light",
@@ -504,14 +669,14 @@ const THEME_NAMES: [&str; 5] = [
     "kaolin-valley-dark",
 ];
 
-const THEMES: [Theme; 5] = [
+const THEMES: &[Theme] = &[
     Theme {
         name: "kanagawa",
         normal: b"\x1b[38;2;220;215;186m\x1b[48;2;31;31;40m",
         gutter: b"\x1b[38;2;114;113;105m\x1b[48;2;31;31;40m",
         status: b"\x1b[38;2;220;215;186m\x1b[48;2;42;42;55m",
-        search_scope: b"\x1b[38;2;190;186;164m\x1b[48;2;38;39;50m",
-        selection: b"\x1b[38;2;220;215;186m\x1b[48;2;45;79;103m",
+        selection_background: b"\x1b[48;2;45;79;103m",
+        preview_line_background: b"\x1b[48;2;38;39;50m",
         cursor: b"\x1b[38;2;31;31;40m\x1b[48;2;200;192;147m",
         syntax: [
             b"\x1b[38;2;114;113;105m\x1b[48;2;31;31;40m",
@@ -544,8 +709,8 @@ const THEMES: [Theme; 5] = [
         normal: b"\x1b[38;2;192;192;192m\x1b[48;2;18;18;18m",
         gutter: b"\x1b[38;2;100;100;100m\x1b[48;2;18;18;18m",
         status: b"\x1b[38;2;230;230;230m\x1b[48;2;45;45;45m",
-        search_scope: b"\x1b[38;2;190;190;190m\x1b[48;2;31;31;36m",
-        selection: b"\x1b[38;2;240;240;240m\x1b[48;2;62;62;78m",
+        selection_background: b"\x1b[48;2;62;62;78m",
+        preview_line_background: b"\x1b[48;2;31;31;36m",
         cursor: b"\x1b[38;2;18;18;18m\x1b[48;2;255;215;95m",
         syntax: [
             b"\x1b[38;2;105;105;105m\x1b[48;2;18;18;18m",
@@ -578,8 +743,8 @@ const THEMES: [Theme; 5] = [
         normal: b"\x1b[38;2;92;106;114m\x1b[48;2;253;246;227m",
         gutter: b"\x1b[38;2;147;157;148m\x1b[48;2;253;246;227m",
         status: b"\x1b[38;2;79;91;88m\x1b[48;2;229;223;204m",
-        search_scope: b"\x1b[38;2;105;116;112m\x1b[48;2;240;235;218m",
-        selection: b"\x1b[38;2;79;91;88m\x1b[48;2;211;222;203m",
+        selection_background: b"\x1b[48;2;211;222;203m",
+        preview_line_background: b"\x1b[48;2;240;235;218m",
         cursor: b"\x1b[38;2;253;246;227m\x1b[48;2;130;150;116m",
         syntax: [
             b"\x1b[38;2;147;157;148m\x1b[48;2;253;246;227m",
@@ -612,8 +777,8 @@ const THEMES: [Theme; 5] = [
         normal: b"\x1b[38;2;205;213;223m\x1b[48;2;10;28;38m",
         gutter: b"\x1b[38;2;75;103;117m\x1b[48;2;10;28;38m",
         status: b"\x1b[38;2;205;213;223m\x1b[48;2;20;48;61m",
-        search_scope: b"\x1b[38;2;166;180;190m\x1b[48;2;15;39;50m",
-        selection: b"\x1b[38;2;226;232;240m\x1b[48;2;33;73;92m",
+        selection_background: b"\x1b[48;2;33;73;92m",
+        preview_line_background: b"\x1b[48;2;15;39;50m",
         cursor: b"\x1b[38;2;10;28;38m\x1b[48;2;73;214;183m",
         syntax: [
             b"\x1b[38;2;75;103;117m\x1b[48;2;10;28;38m",
@@ -646,8 +811,8 @@ const THEMES: [Theme; 5] = [
         normal: b"\x1b[38;2;224;223;219m\x1b[48;2;38;36;48m",
         gutter: b"\x1b[38;2;112;106;128m\x1b[48;2;38;36;48m",
         status: b"\x1b[38;2;224;223;219m\x1b[48;2;55;51;69m",
-        search_scope: b"\x1b[38;2;190;186;196m\x1b[48;2;48;44;60m",
-        selection: b"\x1b[38;2;239;236;228m\x1b[48;2;73;62;91m",
+        selection_background: b"\x1b[48;2;73;62;91m",
+        preview_line_background: b"\x1b[48;2;48;44;60m",
         cursor: b"\x1b[38;2;38;36;48m\x1b[48;2;205;145;165m",
         syntax: [
             b"\x1b[38;2;112;106;128m\x1b[48;2;38;36;48m",
@@ -772,6 +937,9 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
         project_search,
         project_search_task,
         project_discovery,
+        workspace_refresh_task: None,
+        workspace_fingerprint: 0,
+        workspace_refresh_at: std::time::Instant::now() + std::time::Duration::from_secs(2),
         rust_methods,
         completion: None,
         register: Register {
@@ -780,7 +948,9 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
         },
         clipboard_copy_task: None,
         clipboard_paste_task: None,
+        clipboard_paste_replaces: false,
         diagnostics,
+        format_task: None,
     };
     if open_picker {
         editor_open_picker(&mut editor, PickerKind::Files);
@@ -851,13 +1021,17 @@ pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Resu
     let mut input_changed = true;
     loop {
         let background_changed = editor_poll_project_discovery(editor)
+            | editor_poll_workspace_refresh(editor)
             | editor_poll_project_search(editor)
             | editor_step_project_search(editor)
             | editor_step_syntax_highlighting(editor)
+            | editor_poll_picker_preview_load(editor)
+            | editor_step_picker_preview(editor)
             | editor_step_code_index(editor)
             | editor_step_git_gutter(editor)
             | editor_poll_rust_methods(editor)
             | editor_poll_clipboard(editor)
+            | editor_poll_format(editor)
             | diagnostics_poll(&mut editor.diagnostics);
         if input_changed || background_changed {
             match editor_render(editor, terminal) {
@@ -865,7 +1039,9 @@ pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Resu
                 Err(error) => return Err(error),
             }
         }
-        let timeout = if editor_background_work_pending(editor) {
+        let timeout = if editor_incremental_work_pending(editor) {
+            0
+        } else if editor_background_work_pending(editor) {
             16
         } else {
             100
@@ -931,8 +1107,10 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             (PendingKey::Space, Key::Character('D')) => {
                 editor_open_picker(editor, PickerKind::WorkspaceDiagnostics)
             }
+            (PendingKey::Space, Key::Character('a')) => editor_fill_struct_fields(editor),
             (PendingKey::Space, Key::Character('Y')) => editor_yank_system(editor),
             (PendingKey::Space, Key::Character('P')) => editor_paste_system(editor),
+            (PendingKey::Space, Key::Character('R')) => editor_replace_system(editor),
             (PendingKey::SpaceTheme, Key::Character('d' | 'k')) => editor_set_theme(editor, 0),
             (PendingKey::SpaceTheme, Key::Character('b')) => editor_set_theme(editor, 1),
             (PendingKey::SpaceTheme, Key::Character('l')) => editor_set_theme(editor, 2),
@@ -973,6 +1151,12 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             (PendingKey::Match, Key::Character('i')) => {
                 editor.pending_key = PendingKey::MatchInside
             }
+            (PendingKey::Match, Key::Character('s')) => {
+                editor.pending_key = PendingKey::MatchSurround
+            }
+            (PendingKey::Match, Key::Character('r')) => {
+                editor.pending_key = PendingKey::MatchReplaceFrom
+            }
             (PendingKey::MatchAround, Key::Character(delimiter)) => {
                 if delimiter == 'f' {
                     editor_select_enclosing_function(editor, false);
@@ -986,6 +1170,15 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
                 } else {
                     editor_select_surrounding(editor, delimiter, true);
                 }
+            }
+            (PendingKey::MatchSurround, Key::Character(delimiter)) => {
+                editor_add_surround(editor, delimiter)
+            }
+            (PendingKey::MatchReplaceFrom, Key::Character(delimiter)) => {
+                editor.pending_key = PendingKey::MatchReplaceTo(delimiter)
+            }
+            (PendingKey::MatchReplaceTo(from), Key::Character(to)) => {
+                editor_replace_surround(editor, from, to)
             }
             (PendingKey::InsertLineAbove, Key::Character(' ')) => {
                 editor_insert_blank_lines(editor, false)
@@ -1010,6 +1203,12 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             }
             (PendingKey::InsertLineBelow, Key::Character('d')) => {
                 editor_next_diagnostic(editor, true)
+            }
+            (PendingKey::InsertLineAbove, Key::Character('a')) => {
+                editor_goto_argument(editor, false)
+            }
+            (PendingKey::InsertLineBelow, Key::Character('a')) => {
+                editor_goto_argument(editor, true)
             }
             _ => {}
         }
@@ -1047,6 +1246,10 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             editor_jump(editor, true);
             return false;
         }
+        Key::Control(3) => {
+            editor_toggle_line_comments(editor);
+            return false;
+        }
         _ => {}
     }
 
@@ -1063,6 +1266,7 @@ pub fn editor_save(editor: &mut Editor) {
     if document_write(&mut editor.documents[current], &mut editor.status) {
         editor.quit_warning = false;
         diagnostics_restart(&mut editor.diagnostics);
+        editor_reindex_workspace(editor);
     }
 }
 
@@ -1092,6 +1296,116 @@ fn document_write(document: &mut Document, status: &mut String) -> bool {
     true
 }
 
+fn editor_reindex_workspace(editor: &mut Editor) {
+    profiling::function_scope!();
+    if let Some(task) = editor.project_search_task.take() {
+        task.cancel();
+    }
+    editor.project_search_task = Some(project_search_spawn(&editor.project));
+    if !cfg!(test) {
+        rust_method_index_restart(
+            &mut editor.rust_methods,
+            &editor.project.root,
+            std::sync::Arc::clone(&editor.project.paths),
+        );
+    }
+}
+
+fn workspace_snapshot(root: std::path::PathBuf) -> WorkspaceSnapshot {
+    profiling::function_scope!();
+    let project = project_discover(root, usize::MAX).project;
+    let mut fingerprint = 0xcbf29ce484222325u64;
+    for path in project.paths.iter() {
+        for &byte in path.as_os_str().as_encoded_bytes() {
+            fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        fingerprint = (fingerprint ^ metadata.len()).wrapping_mul(0x100000001b3);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            fingerprint = (fingerprint ^ duration.as_secs()).wrapping_mul(0x100000001b3);
+            fingerprint =
+                (fingerprint ^ u64::from(duration.subsec_nanos())).wrapping_mul(0x100000001b3);
+        }
+    }
+    if let Some(ignore_file) = project.ignore_file.as_deref()
+        && let Ok(metadata) = std::fs::metadata(ignore_file)
+    {
+        fingerprint = (fingerprint ^ metadata.len()).wrapping_mul(0x100000001b3);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            fingerprint = (fingerprint ^ duration.as_secs()).wrapping_mul(0x100000001b3);
+            fingerprint =
+                (fingerprint ^ u64::from(duration.subsec_nanos())).wrapping_mul(0x100000001b3);
+        }
+    }
+    WorkspaceSnapshot {
+        project,
+        fingerprint,
+    }
+}
+
+fn editor_poll_workspace_refresh(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let complete = editor
+        .workspace_refresh_task
+        .as_ref()
+        .is_some_and(idno_std::micropool::OwnedTask::complete);
+    if complete {
+        let Some(task) = editor.workspace_refresh_task.take() else {
+            return false;
+        };
+        let snapshot = task.join();
+        editor.workspace_refresh_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if editor.workspace_fingerprint == snapshot.fingerprint {
+            return false;
+        }
+        editor.workspace_fingerprint = snapshot.fingerprint;
+        editor.project = snapshot.project;
+        editor.project_discovery = None;
+        editor_reindex_workspace(editor);
+        if editor.picker.is_some() {
+            let mut picker = editor.picker.take().unwrap();
+            picker_refresh(editor, &mut picker);
+            picker.preview = None;
+            picker_rebuild_preview(editor, &mut picker);
+            editor.picker = Some(picker);
+        }
+        return true;
+    }
+    if editor.workspace_refresh_task.is_none()
+        && editor.project_discovery.is_none()
+        && !cfg!(test)
+        && std::time::Instant::now() >= editor.workspace_refresh_at
+    {
+        let root = editor.project.root.clone();
+        editor.workspace_refresh_task =
+            Some(idno_std::threads().spawn_owned(move || workspace_snapshot(root)));
+    }
+    false
+}
+
+fn editor_finish_workspace_refresh(editor: &mut Editor) {
+    profiling::function_scope!();
+    let Some(task) = editor.workspace_refresh_task.take() else {
+        return;
+    };
+    let snapshot = task.join();
+    editor.workspace_refresh_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    if editor.workspace_fingerprint == snapshot.fingerprint {
+        return;
+    }
+    editor.workspace_fingerprint = snapshot.fingerprint;
+    editor.project = snapshot.project;
+    editor.project_discovery = None;
+    editor_reindex_workspace(editor);
+}
+
 fn editor_save_all(editor: &mut Editor) -> bool {
     profiling::function_scope!();
     editor.status.clear();
@@ -1110,6 +1424,9 @@ fn editor_save_all(editor: &mut Editor) -> bool {
     write!(&mut editor.status, "wrote {written} buffer(s)").unwrap();
     editor.quit_warning = false;
     diagnostics_restart(&mut editor.diagnostics);
+    if written > 0 {
+        editor_reindex_workspace(editor);
+    }
     true
 }
 
@@ -1415,6 +1732,10 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         query: String::new(),
         matches: Vec::new(),
         selected: 0,
+        first_visible: 0,
+        tab_cycling: false,
+        original_theme: editor.theme,
+        theme_preview: false,
         search_query: String::new(),
         search_candidates: Vec::new(),
         search_candidate_position: 0,
@@ -1425,11 +1746,22 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         symbol_corpus: SearchCorpus {
             bytes: Vec::new(),
             lines: Vec::new(),
+            identifiers: Vec::new(),
+            symbols: Vec::new(),
+        },
+        preview_corpus: SearchCorpus {
+            bytes: Vec::new(),
+            lines: Vec::new(),
+            identifiers: Vec::new(),
+            symbols: Vec::new(),
         },
         symbol_candidates: Vec::new(),
         rust_symbol_candidates: Vec::new(),
         reference_targets: Vec::new(),
         diagnostic_candidates: Vec::new(),
+        preview: None,
+        preview_load_key: None,
+        preview_load_task: None,
     };
     if kind == PickerKind::DocumentSymbols {
         search_corpus_index_document(editor_document(editor), &mut picker.symbol_corpus);
@@ -1471,6 +1803,7 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         }
     }
     picker_refresh(editor, &mut picker);
+    picker_rebuild_preview(editor, &mut picker);
     editor.picker = Some(picker);
 }
 
@@ -1580,11 +1913,20 @@ pub fn picker_refresh(editor: &Editor, picker: &mut Picker) {
     picker.selected = picker
         .selected
         .min(picker_visible_len(editor, picker).saturating_sub(1));
+    picker_ensure_selected_visible(picker, picker_result_rows(editor));
 }
 
 fn editor_handle_picker_key(editor: &mut Editor, key: Key) -> bool {
     match key {
-        Key::Escape => editor.picker = None,
+        Key::Escape => {
+            let mut picker = editor.picker.take().unwrap();
+            if picker.theme_preview {
+                editor.theme = picker.original_theme;
+            }
+            if let Some(task) = picker.preview_load_task.take() {
+                task.cancel();
+            }
+        }
         Key::Enter => {
             editor_accept_picker(editor);
             if editor.quit_requested {
@@ -1592,49 +1934,149 @@ fn editor_handle_picker_key(editor: &mut Editor, key: Key) -> bool {
             }
         }
         Key::Up | Key::Control(16) => {
+            let rows = picker_result_rows(editor);
             let picker = editor.picker.as_mut().unwrap();
             picker.selected = picker.selected.saturating_sub(1);
+            picker_ensure_selected_visible(picker, rows);
         }
         Key::Down | Key::Control(14) => {
             let visible_len = picker_visible_len(editor, editor.picker.as_ref().unwrap());
+            let rows = picker_result_rows(editor);
             let picker = editor.picker.as_mut().unwrap();
             picker.selected = (picker.selected + 1).min(visible_len.saturating_sub(1));
-        }
-        Key::Tab
-            if editor.picker.as_ref().map(|picker| picker.kind)
-                == Some(PickerKind::SearchProject) =>
-        {
-            let visible_len = picker_visible_len(editor, editor.picker.as_ref().unwrap());
-            let picker = editor.picker.as_mut().unwrap();
-            picker.selected = (picker.selected + 1).min(visible_len.saturating_sub(1));
+            picker_ensure_selected_visible(picker, rows);
         }
         Key::Tab => {
             let mut picker = editor.picker.take().unwrap();
-            picker_complete(editor, &mut picker);
-            picker_refresh(editor, &mut picker);
+            picker_tab(editor, &mut picker, true);
+            editor.picker = Some(picker);
+        }
+        Key::BackTab => {
+            let mut picker = editor.picker.take().unwrap();
+            picker_tab(editor, &mut picker, false);
             editor.picker = Some(picker);
         }
         Key::Backspace => {
             let mut picker = editor.picker.take().unwrap();
+            picker_restore_preview_theme(editor, &mut picker);
+            picker.tab_cycling = false;
             picker.query.pop();
             picker_refresh(editor, &mut picker);
             editor.picker = Some(picker);
         }
         Key::Character(character) => {
             let mut picker = editor.picker.take().unwrap();
-            picker.query.push(character);
+            picker_restore_preview_theme(editor, &mut picker);
+            picker.tab_cycling = false;
+            if character == ' '
+                && picker.kind == PickerKind::Commands
+                && !picker.query.contains(char::is_whitespace)
+            {
+                picker_complete(editor, &mut picker);
+                if !picker.query.ends_with(' ') {
+                    picker.query.push(' ');
+                }
+            } else {
+                picker.query.push(character);
+            }
             picker_refresh(editor, &mut picker);
             editor.picker = Some(picker);
         }
         _ => {}
     }
+    if let Some(mut picker) = editor.picker.take() {
+        picker_rebuild_preview(editor, &mut picker);
+        editor.picker = Some(picker);
+    }
     false
 }
 
-fn editor_accept_picker(editor: &mut Editor) {
-    let Some(picker) = editor.picker.take() else {
+fn picker_tab(editor: &mut Editor, picker: &mut Picker, forward: bool) {
+    profiling::function_scope!();
+    let visible_len = picker_visible_len(editor, picker);
+    if visible_len == 0 {
+        return;
+    }
+    let completes_argument = picker.kind == PickerKind::Commands
+        && (command_theme_argument(&picker.query).is_some()
+            || command_file_argument(&picker.query).is_some());
+    if picker.kind != PickerKind::Commands {
+        picker.selected = picker_next_selection(picker.selected, visible_len, forward);
+        picker_ensure_selected_visible(picker, picker_result_rows(editor));
+        return;
+    }
+    if completes_argument {
+        if picker.tab_cycling {
+            picker.selected = picker_next_selection(picker.selected, visible_len, forward);
+        } else if !forward {
+            picker.selected = picker_next_selection(picker.selected, visible_len, false);
+        }
+        picker.tab_cycling = true;
+        picker_complete(editor, picker);
+        picker_preview_theme(editor, picker);
+        picker_ensure_selected_visible(picker, picker_result_rows(editor));
+        return;
+    }
+    picker.selected = picker_next_selection(picker.selected, visible_len, forward);
+    picker.tab_cycling = true;
+    picker_ensure_selected_visible(picker, picker_result_rows(editor));
+}
+
+fn picker_result_rows(editor: &Editor) -> usize {
+    let margin = (editor.terminal_height / 10).clamp(1, 4);
+    editor
+        .terminal_height
+        .saturating_sub(margin * 2)
+        .max(1)
+        .saturating_sub(4)
+}
+
+fn picker_ensure_selected_visible(picker: &mut Picker, rows: usize) {
+    if rows == 0 || picker.selected < picker.first_visible {
+        picker.first_visible = picker.selected;
+    } else if picker.selected >= picker.first_visible + rows {
+        picker.first_visible = picker.selected + 1 - rows;
+    }
+}
+
+fn picker_next_selection(selected: usize, length: usize, forward: bool) -> usize {
+    if forward {
+        (selected + 1) % length
+    } else if selected == 0 {
+        length - 1
+    } else {
+        selected - 1
+    }
+}
+
+fn picker_preview_theme(editor: &mut Editor, picker: &mut Picker) {
+    if command_theme_argument(&picker.query).is_none() {
+        return;
+    }
+    let Some(found) = picker.matches.get(picker.selected) else {
         return;
     };
+    if found.item >= THEMES.len() {
+        return;
+    }
+    editor.theme = found.item;
+    picker.theme_preview = true;
+}
+
+fn picker_restore_preview_theme(editor: &mut Editor, picker: &mut Picker) {
+    if picker.theme_preview {
+        editor.theme = picker.original_theme;
+        picker.theme_preview = false;
+    }
+}
+
+fn editor_accept_picker(editor: &mut Editor) {
+    let Some(mut picker) = editor.picker.take() else {
+        return;
+    };
+    if let Some(task) = picker.preview_load_task.take() {
+        task.cancel();
+    }
     if picker.kind == PickerKind::Commands && command_file_argument(&picker.query).is_some() {
         editor_execute_command(editor, &picker.query);
         return;
@@ -1829,9 +2271,9 @@ fn editor_poll_project_discovery(editor: &mut Editor) -> bool {
         std::time::Duration::from_millis(2),
     );
     let discovered_files = editor.project.paths.len();
-    if editor.picker.as_ref().map(|picker| picker.kind) == Some(PickerKind::Files)
-        && discovered_files > previous_files
-    {
+    let file_picker_visible =
+        editor.picker.as_ref().map(|picker| picker.kind) == Some(PickerKind::Files);
+    if file_picker_visible && discovered_files > previous_files {
         let mut picker = editor.picker.take().unwrap();
         picker_extend_file_matches(editor, &mut picker, previous_files);
         editor.picker = Some(picker);
@@ -1857,10 +2299,16 @@ fn editor_poll_project_discovery(editor: &mut Editor) -> bool {
                 std::sync::Arc::clone(&editor.project.paths),
             );
         }
+        if editor.project_search.is_some() && editor.picker.is_some() {
+            let mut picker = editor.picker.take().unwrap();
+            picker.preview = None;
+            picker_rebuild_preview(editor, &mut picker);
+            editor.picker = Some(picker);
+        }
     } else {
         editor.project_discovery = Some(discovery);
     }
-    discovered_files > previous_files || complete
+    (file_picker_visible && discovered_files > previous_files) || complete
 }
 
 fn picker_extend_file_matches(editor: &Editor, picker: &mut Picker, start: usize) {
@@ -1921,6 +2369,7 @@ fn project_search_should_build_inline(project: &ProjectFiles) -> bool {
 }
 
 fn editor_poll_project_search(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
     let complete = editor
         .project_search_task
         .as_ref()
@@ -1938,12 +2387,27 @@ fn editor_poll_project_search(editor: &mut Editor) -> bool {
             return false;
         }
     }
-    if editor.picker.as_ref().map(|picker| picker.kind) == Some(PickerKind::SearchProject) {
+    if editor.picker.is_some() {
         let mut picker = editor.picker.take().unwrap();
-        picker_refresh(editor, &mut picker);
+        if picker.kind == PickerKind::SearchProject {
+            picker_refresh(editor, &mut picker);
+        }
+        picker.preview = None;
+        picker_rebuild_preview(editor, &mut picker);
         editor.picker = Some(picker);
     }
     true
+}
+
+fn editor_finish_project_search(editor: &mut Editor) {
+    profiling::function_scope!();
+    while editor.project_discovery.is_some() {
+        editor_poll_project_discovery(editor);
+    }
+    let Some(task) = editor.project_search_task.take() else {
+        return;
+    };
+    editor.project_search = Some(task.join());
 }
 
 fn picker_project_search_begin(editor: &Editor, picker: &mut Picker) {
@@ -2065,6 +2529,9 @@ fn editor_step_project_search(editor: &mut Editor) -> bool {
     }
     let mut picker = editor.picker.take().unwrap();
     let changed = picker_project_search_step(editor, &mut picker, 4096);
+    if changed {
+        picker_rebuild_preview(editor, &mut picker);
+    }
     editor.picker = Some(picker);
     changed
 }
@@ -2079,6 +2546,30 @@ fn editor_background_work_pending(editor: &Editor) -> bool {
         || editor.clipboard_copy_task.is_some()
         || editor.clipboard_paste_task.is_some()
         || diagnostics_pending(&editor.diagnostics)
+        || editor.format_task.is_some()
+        || editor
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.preview_load_task.is_some())
+        || editor
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.preview.as_ref())
+            .is_some_and(|preview| !preview.syntax.complete)
+        || editor.picker.as_ref().is_some_and(|picker| {
+            picker.kind == PickerKind::SearchProject && !picker.search_complete
+        })
+}
+
+fn editor_incremental_work_pending(editor: &Editor) -> bool {
+    editor.project_discovery.is_some()
+        || !editor_document(editor).syntax.complete
+        || !editor_document(editor).code_index.complete
+        || editor
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.preview.as_ref())
+            .is_some_and(|preview| !preview.syntax.complete)
         || editor.picker.as_ref().is_some_and(|picker| {
             picker.kind == PickerKind::SearchProject && !picker.search_complete
         })
@@ -2102,6 +2593,62 @@ fn editor_step_syntax_highlighting(editor: &mut Editor) -> bool {
         128 * 1024,
         std::time::Duration::from_micros(500),
     )
+}
+
+fn editor_step_picker_preview(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let Some(preview) = editor
+        .picker
+        .as_mut()
+        .and_then(|picker| picker.preview.as_mut())
+    else {
+        return false;
+    };
+    syntax_highlighting_step(
+        &preview.buffer,
+        &mut preview.syntax,
+        128 * 1024,
+        std::time::Duration::from_micros(500),
+    )
+}
+
+fn editor_poll_picker_preview_load(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let complete = editor
+        .picker
+        .as_ref()
+        .and_then(|picker| picker.preview_load_task.as_ref())
+        .is_some_and(idno_std::micropool::OwnedTask::complete);
+    if !complete {
+        return false;
+    }
+    let mut picker = editor.picker.take().unwrap();
+    let Some(task) = picker.preview_load_task.take() else {
+        editor.picker = Some(picker);
+        return false;
+    };
+    let loaded = match task.try_join() {
+        Ok(loaded) => loaded,
+        Err(task) => {
+            picker.preview_load_task = Some(task);
+            editor.picker = Some(picker);
+            return false;
+        }
+    };
+    if picker.preview_load_key == Some(loaded.key) && loaded.available {
+        picker_preview_cache_set(
+            &mut picker,
+            loaded.key,
+            Some(&loaded.path),
+            &loaded.bytes,
+            loaded.target_line,
+            loaded.target_start..loaded.target_end,
+            loaded.first_line_number,
+        );
+    }
+    picker.preview_load_key = None;
+    editor.picker = Some(picker);
+    true
 }
 
 fn editor_step_code_index(editor: &mut Editor) -> bool {
@@ -2132,6 +2679,8 @@ fn search_corpus_index_document(document: &Document, corpus: &mut SearchCorpus) 
     profiling::function_scope!();
     corpus.bytes.clear();
     corpus.lines.clear();
+    corpus.identifiers.clear();
+    corpus.symbols.clear();
     let length = buffer_len(&document.buffer);
     let mut start = 0;
     let mut line_number = 1;
@@ -2223,6 +2772,19 @@ fn rust_symbol_name_range(line: &[u8]) -> Option<(usize, usize)> {
             }
             continue;
         }
+        if word == b"macro_rules" {
+            if line.get(position) == Some(&b'!') {
+                position += 1;
+            }
+            rust_skip_ascii_whitespace(line, &mut position);
+            let name_start = position;
+            while position < line.len()
+                && (line[position].is_ascii_alphanumeric() || line[position] == b'_')
+            {
+                position += 1;
+            }
+            return (position > name_start).then_some((name_start, position));
+        }
         if !matches!(
             word,
             b"fn" | b"struct" | b"enum" | b"trait" | b"type" | b"mod" | b"static" | b"let"
@@ -2255,9 +2817,12 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
     let mut corpus = SearchCorpus {
         bytes: Vec::with_capacity(256 * 1024),
         lines: Vec::with_capacity(4096),
+        identifiers: Vec::with_capacity(16 * 1024),
+        symbols: Vec::with_capacity(4096),
     };
     let temp = idno_std::mem().scratch().temp();
     let mut source = temp.vec(64 * 1024);
+    let mut source_identifiers = temp.vec(8192);
     let mut read_bytes = [0; 64 * 1024];
     for (project_file, path) in paths.iter().enumerate() {
         source.clear();
@@ -2286,6 +2851,11 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
             continue;
         }
         let label = &labels[project_file];
+        source_identifiers.clear();
+        if label.ends_with(".rs") {
+            rust_source_identifiers(&source, &mut source_identifiers);
+        }
+        let mut source_identifier = 0usize;
         let mut start = 0;
         let mut line_number = 1;
         while start <= source.len() {
@@ -2312,6 +2882,39 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
                 display_start: display_start as u32,
                 display_end: text_end as u32,
             });
+            if label.ends_with(".rs")
+                && let Some((name_start, name_end)) = rust_symbol_name_range(&source[start..end])
+            {
+                corpus.symbols.push(SearchSymbol {
+                    name_start: (text_start + name_start) as u32,
+                    name_end: (text_start + name_end) as u32,
+                    project_file: project_file as u32,
+                    start: (start + name_start) as u32,
+                    end: (start + name_end) as u32,
+                });
+            }
+            let line_index = corpus.lines.len() - 1;
+            while source_identifier < source_identifiers.len()
+                && (source_identifiers[source_identifier].start as usize) < end
+            {
+                let identifier = source_identifiers[source_identifier].clone();
+                if identifier.start as usize >= start
+                    && identifier.end as usize <= end
+                    && line_index <= u32::MAX as usize
+                {
+                    let within_start = identifier.start as usize - start;
+                    let within_end = identifier.end as usize - start;
+                    corpus.identifiers.push(SearchIdentifier {
+                        name_start: (text_start + within_start) as u32,
+                        name_end: (text_start + within_end) as u32,
+                        project_file: project_file as u32,
+                        file_start: identifier.start,
+                        file_end: identifier.end,
+                        line: line_index as u32,
+                    });
+                }
+                source_identifier += 1;
+            }
             if end >= source.len() {
                 break;
             }
@@ -2319,6 +2922,18 @@ fn project_search_index(paths: &[std::path::PathBuf], labels: &[String]) -> Sear
             line_number += 1;
         }
     }
+    corpus.identifiers.sort_unstable_by(|left, right| {
+        corpus.bytes[left.name_start as usize..left.name_end as usize]
+            .cmp(&corpus.bytes[right.name_start as usize..right.name_end as usize])
+            .then_with(|| left.project_file.cmp(&right.project_file))
+            .then_with(|| left.file_start.cmp(&right.file_start))
+    });
+    corpus.symbols.sort_unstable_by(|left, right| {
+        corpus.bytes[left.name_start as usize..left.name_end as usize]
+            .cmp(&corpus.bytes[right.name_start as usize..right.name_end as usize])
+            .then_with(|| left.project_file.cmp(&right.project_file))
+            .then_with(|| left.start.cmp(&right.start))
+    });
     corpus
 }
 
@@ -2329,6 +2944,7 @@ fn editor_accept_project_search(editor: &mut Editor, picker: &Picker, item: usiz
     let Some(line) = corpus.lines.get(item).copied() else {
         return;
     };
+    let before = editor_location(editor);
     editor_open_project_file(editor, line.project_file as usize);
     let searched_project_file = line.project_file;
     editor.search_query.clear();
@@ -2374,6 +2990,9 @@ fn editor_accept_project_search(editor: &mut Editor, picker: &Picker, item: usiz
         .position(|selection| start <= selection.anchor && selection.anchor <= line_end)
         .unwrap_or(0);
     editor.mode = Mode::Normal;
+    editor_center_view(editor);
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
 }
 
 fn editor_start_search(editor: &mut Editor, kind: SearchKind) {
@@ -2385,6 +3004,8 @@ fn editor_start_search(editor: &mut Editor, kind: SearchKind) {
     let mut corpus = SearchCorpus {
         bytes: Vec::with_capacity(buffer_len(&document.buffer)),
         lines: Vec::with_capacity(buffer_line_count(&document.buffer)),
+        identifiers: Vec::new(),
+        symbols: Vec::new(),
     };
     search_corpus_index_document(document, &mut corpus);
     editor.search = Some(SearchSession {
@@ -2817,6 +3438,7 @@ pub fn editor_execute_command(editor: &mut Editor, input: &str) {
             editor_reload_document(editor);
         }
         "reload-all" | "reload-all!" | "rla" | "rla!" => editor_reload_all_documents(editor),
+        "format" => editor_format_document(editor),
         "toggle-auto-indentation" => {
             let enabled = !editor.config.flags.contains(EditorFlags::AUTO_INDENTATION);
             editor
@@ -2896,6 +3518,7 @@ fn editor_reload_document(editor: &mut Editor) -> bool {
     document_replace_ranges(document, &mut replacements, &source, Some(&after));
     document.modified = false;
     write!(&mut editor.status, "reloaded {} bytes", source.len()).unwrap();
+    editor_reindex_workspace(editor);
     true
 }
 
@@ -2913,6 +3536,137 @@ fn editor_reload_all_documents(editor: &mut Editor) {
     editor.current = current.min(editor.documents.len().saturating_sub(1));
     editor.status.clear();
     write!(&mut editor.status, "reloaded {reloaded} buffer(s)").unwrap();
+}
+
+fn editor_format_document(editor: &mut Editor) {
+    profiling::function_scope!();
+    if editor.format_task.is_some() {
+        editor.status.push_str("formatter is already running");
+        return;
+    }
+    let document = editor_document(editor);
+    let Some(path) = document.path.as_deref() else {
+        editor.status.push_str("scratch buffer has no formatter");
+        return;
+    };
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
+    let (formatter, arguments): (&'static str, &'static [&'static str]) = match extension {
+        "rs" => ("rustfmt", &["--emit", "stdout", "--edition", "2024"]),
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => ("clang-format", &[]),
+        "go" => ("gofmt", &[]),
+        _ => {
+            editor.status.push_str("no formatter for current file");
+            return;
+        }
+    };
+    let mut original = Vec::with_capacity(buffer_len(&document.buffer));
+    buffer_append_range(
+        &document.buffer,
+        0,
+        buffer_len(&document.buffer),
+        &mut original,
+    );
+    let document_index = editor.current;
+    editor.format_task = Some(idno_std::threads().spawn_owned(move || {
+        profiling::scope!("format_document");
+        let mut command = std::process::Command::new(formatter);
+        command
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return FormatResult {
+                    document: document_index,
+                    original,
+                    formatted: Vec::new(),
+                    formatter,
+                    success: false,
+                };
+            }
+        };
+        let wrote_input = match child.stdin.take() {
+            Some(mut input) => input.write_all(&original).is_ok(),
+            None => false,
+        };
+        let output = child.wait_with_output();
+        let (formatted, success) = match output {
+            Ok(output) => (output.stdout, wrote_input && output.status.success()),
+            Err(_) => (Vec::new(), false),
+        };
+        FormatResult {
+            document: document_index,
+            original,
+            formatted,
+            formatter,
+            success,
+        }
+    }));
+    write!(&mut editor.status, "formatting with {formatter}").unwrap();
+}
+
+fn editor_poll_format(editor: &mut Editor) -> bool {
+    profiling::function_scope!();
+    let complete = editor
+        .format_task
+        .as_ref()
+        .is_some_and(idno_std::micropool::OwnedTask::complete);
+    if !complete {
+        return false;
+    }
+    let Some(task) = editor.format_task.take() else {
+        return false;
+    };
+    let result = match task.try_join() {
+        Ok(result) => result,
+        Err(task) => {
+            editor.format_task = Some(task);
+            return false;
+        }
+    };
+    if !result.success {
+        write!(&mut editor.status, "{} failed", result.formatter).unwrap();
+        return true;
+    }
+    let Some(document) = editor.documents.get_mut(result.document) else {
+        return true;
+    };
+    let unchanged = result.original.len() == buffer_len(&document.buffer)
+        && result
+            .original
+            .iter()
+            .enumerate()
+            .all(|(position, &byte)| buffer_byte(&document.buffer, position) == byte);
+    if !unchanged {
+        editor
+            .status
+            .push_str("format result discarded: buffer changed");
+        return true;
+    }
+    if result.original == result.formatted {
+        editor.status.push_str("already formatted");
+        return true;
+    }
+    let cursor = document.cursor.min(result.formatted.len());
+    let after = [SelectionState {
+        cursor,
+        anchor: cursor,
+    }];
+    let temp = idno_std::mem().scratch().temp();
+    let mut replacements = temp.vec(1);
+    replacements.push(Replacement {
+        start: 0,
+        end: buffer_len(&document.buffer),
+        inserted: 0..result.formatted.len(),
+    });
+    document_replace_ranges(document, &mut replacements, &result.formatted, Some(&after));
+    write!(&mut editor.status, "formatted with {}", result.formatter).unwrap();
+    true
 }
 
 fn editor_set_document_path(editor: &mut Editor, path: &str) {
@@ -3091,13 +3845,39 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
             }
             document_replace_ranges(document, &mut replacements, &[], None);
         }
+        Key::Enter if editor.completion.is_some() => editor_accept_completion(editor),
         Key::Enter => {
             editor.completion = None;
             editor_insert_newline(editor);
         }
-        Key::Tab if editor.completion.is_some() => editor_accept_completion(editor),
-        Key::Tab => editor_insert(editor, "\t"),
+        Key::Tab => {
+            if editor.completion.is_none() {
+                editor_refresh_completion(editor);
+            }
+            if editor.completion.is_none()
+                && editor_rust_completion_context(editor)
+                && rust_method_index_finish(&mut editor.rust_methods)
+            {
+                editor_refresh_completion(editor);
+            }
+            if editor.completion.is_some() {
+                editor_completion_tab(editor);
+            } else if editor_rust_completion_context(editor) {
+                editor.status.push_str("no completion candidates");
+            } else {
+                editor_insert_indentation(editor);
+            }
+        }
+        Key::BackTab if editor.completion.is_some() => editor_select_completion(editor, false),
+        Key::BackTab => {}
         Key::Character(character) => {
+            if editor
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.preview)
+            {
+                editor_accept_completion(editor);
+            }
             if editor.config.flags.contains(EditorFlags::AUTO_PAIRS)
                 && editor_insert_auto_pair(editor, character)
             {
@@ -3108,14 +3888,11 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
             editor_insert(editor, character.encode_utf8(&mut encoded));
             editor_refresh_completion(editor);
         }
-        Key::Control(14) if editor.completion.is_some() => {
-            let completion = editor.completion.as_mut().unwrap();
-            completion.selected =
-                (completion.selected + 1).min(completion.matches.len().saturating_sub(1));
+        Key::Control(14) | Key::Down if editor.completion.is_some() => {
+            editor_select_completion(editor, true)
         }
-        Key::Control(16) if editor.completion.is_some() => {
-            let completion = editor.completion.as_mut().unwrap();
-            completion.selected = completion.selected.saturating_sub(1);
+        Key::Control(16) | Key::Up if editor.completion.is_some() => {
+            editor_select_completion(editor, false)
         }
         Key::Left => editor_move_insert_points_horizontal(editor, false),
         Key::Right => editor_move_insert_points_horizontal(editor, true),
@@ -3126,6 +3903,66 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
         Key::Control(_) | Key::Alt(_) => {}
     }
     false
+}
+
+fn editor_rust_completion_context(editor: &Editor) -> bool {
+    if crate::syntax::syntax_language_from_path(editor_document(editor).path.as_deref())
+        != crate::syntax::SyntaxLanguage::Rust
+    {
+        return false;
+    }
+    let document = editor_document(editor);
+    let position = document
+        .insertion_points
+        .last()
+        .copied()
+        .unwrap_or(document.cursor);
+    let mut start = position;
+    while start > 0 && rust_identifier_byte(buffer_byte(&document.buffer, start - 1)) {
+        start -= 1;
+    }
+    start > 0
+        && (buffer_byte(&document.buffer, start - 1) == b'.'
+            || (start >= 2
+                && buffer_byte(&document.buffer, start - 1) == b':'
+                && buffer_byte(&document.buffer, start - 2) == b':'))
+}
+
+fn editor_select_completion(editor: &mut Editor, forward: bool) {
+    let Some(completion) = editor.completion.as_mut() else {
+        return;
+    };
+    if completion.matches.is_empty() {
+        return;
+    }
+    if !completion.preview {
+        completion.preview = true;
+        if !forward {
+            completion.selected = completion.matches.len() - 1;
+        }
+        return;
+    }
+    completion.selected = if forward {
+        (completion.selected + 1) % completion.matches.len()
+    } else if completion.selected == 0 {
+        completion.matches.len() - 1
+    } else {
+        completion.selected - 1
+    };
+}
+
+fn editor_completion_tab(editor: &mut Editor) {
+    let postfix = editor.completion.as_ref().is_some_and(|completion| {
+        completion
+            .matches
+            .get(completion.selected)
+            .is_some_and(|entry| entry.flags & COMPLETION_POSTFIX != 0)
+    });
+    if postfix {
+        editor_accept_completion(editor);
+    } else {
+        editor_select_completion(editor, true);
+    }
 }
 
 fn editor_indentation_backspace_start(
@@ -3282,6 +4119,7 @@ fn editor_handle_command_key(editor: &mut Editor, key: Key) -> bool {
         Key::Character('k') | Key::Up => editor_move_vertical(editor, false),
         Key::Character('j') | Key::Down => editor_move_vertical(editor, true),
         Key::Tab => editor_jump(editor, true),
+        Key::BackTab => editor_jump(editor, false),
         Key::Character('w') => editor_select_word_motion(editor, true),
         Key::Character('b') => editor_select_word_motion(editor, false),
         Key::Character('n') => editor_search_match(editor, true),
@@ -3292,6 +4130,7 @@ fn editor_handle_command_key(editor: &mut Editor, key: Key) -> bool {
         Key::Character('X') => editor_select_current_lines(editor),
         Key::Character('d') | Key::Delete => editor_delete_selection(editor),
         Key::Character('y') => editor_yank(editor),
+        Key::Character('R') => editor_replace_register(editor),
         Key::Character('p') => editor_paste_register(editor, true),
         Key::Character('P') => editor_paste_register(editor, false),
         Key::Character('c') => editor_change_selection(editor),
@@ -3331,6 +4170,117 @@ fn editor_insert(editor: &mut Editor, text: &str) {
     }
     document_replace_ranges(document, &mut replacements, text.as_bytes(), None);
     editor.quit_warning = false;
+}
+
+fn editor_insert_indentation(editor: &mut Editor) {
+    let indentation_spaces = editor.config.indentation_spaces.max(1);
+    let temp = idno_std::mem().scratch().temp();
+    let mut indentation = temp.vec(indentation_spaces);
+    indentation.extend(std::iter::repeat_n(b' ', indentation_spaces));
+    let indentation = match std::str::from_utf8(&indentation) {
+        Ok(indentation) => indentation,
+        Err(_) => return,
+    };
+    editor_insert(editor, indentation);
+}
+
+fn editor_toggle_line_comments(editor: &mut Editor) {
+    profiling::function_scope!();
+    let token = match editor_document(editor).path.as_deref() {
+        Some(path) => match path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some(
+                "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "go" | "jai"
+                | "odin",
+            ) => b"//".as_slice(),
+            Some("toml" | "nim" | "nims" | "nimble" | "sh" | "bash" | "zsh" | "py") => {
+                b"#".as_slice()
+            }
+            _ if path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    matches!(name, ".bashrc" | ".bash_profile" | ".zshrc" | ".zprofile")
+                }) =>
+            {
+                b"#".as_slice()
+            }
+            _ => {
+                editor.status.push_str("no line comment for this language");
+                return;
+            }
+        },
+        None => {
+            editor.status.push_str("no line comment for this buffer");
+            return;
+        }
+    };
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    let mut lines = temp.vec(selections.len());
+    for selection in &selections {
+        let mut line = buffer_line_start(&document.buffer, selection.anchor.min(selection.cursor));
+        let final_line =
+            buffer_line_start(&document.buffer, selection.anchor.max(selection.cursor));
+        loop {
+            lines.push(line);
+            if line >= final_line {
+                break;
+            }
+            let end = buffer_line_end(&document.buffer, line);
+            if end >= buffer_len(&document.buffer) {
+                break;
+            }
+            line = end + 1;
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    let all_commented = !lines.is_empty()
+        && lines.iter().all(|&line| {
+            let indentation = buffer_line_indentation_end(&document.buffer, line);
+            indentation + token.len() <= buffer_len(&document.buffer)
+                && token.iter().enumerate().all(|(offset, &byte)| {
+                    buffer_byte(&document.buffer, indentation + offset) == byte
+                })
+        });
+    let inserted = if all_commented {
+        b"".as_slice()
+    } else if token == b"//" {
+        b"// ".as_slice()
+    } else {
+        b"# ".as_slice()
+    };
+    let mut replacements = temp.vec(lines.len());
+    for &line in &lines {
+        let indentation = buffer_line_indentation_end(&document.buffer, line);
+        let end = if all_commented {
+            let after_token = indentation + token.len();
+            after_token
+                + usize::from(
+                    after_token < buffer_len(&document.buffer)
+                        && buffer_byte(&document.buffer, after_token) == b' ',
+                )
+        } else {
+            indentation
+        };
+        replacements.push(Replacement {
+            start: indentation,
+            end,
+            inserted: 0..inserted.len(),
+        });
+    }
+    document_replace_ranges(document, &mut replacements, inserted, None);
+}
+
+fn buffer_line_indentation_end(buffer: &GapBuffer, line_start: usize) -> usize {
+    let mut position = line_start;
+    let line_end = buffer_line_end(buffer, line_start);
+    while position < line_end && matches!(buffer_byte(buffer, position), b' ' | b'\t') {
+        position += 1;
+    }
+    position
 }
 
 fn editor_insert_auto_pair(editor: &mut Editor, character: char) -> bool {
@@ -3377,15 +4327,129 @@ fn editor_insert_auto_pair(editor: &mut Editor, character: char) -> bool {
     false
 }
 
+fn rust_callable_insertion(
+    name: &str,
+    detail: &str,
+    receiver: Option<&str>,
+    skip_self: bool,
+    result: &mut Vec<u8, impl Allocator>,
+) -> std::ops::Range<u32> {
+    profiling::function_scope!();
+    result.clear();
+    result.extend_from_slice(name.as_bytes());
+    let signature = detail.lines().next().unwrap_or("").as_bytes();
+    let Some(mut position) = signature.iter().position(|&byte| byte == b'(') else {
+        return 0..0;
+    };
+    position += 1;
+    let mut close = position;
+    let mut depth = 1usize;
+    while close < signature.len() && depth > 0 {
+        depth += usize::from(signature[close] == b'(');
+        depth = depth.saturating_sub(usize::from(signature[close] == b')'));
+        close += 1;
+    }
+    if depth != 0 {
+        return 0..0;
+    }
+    result.push(b'(');
+    let mut first_selection = 0..0;
+    let mut parameter_start = position;
+    let mut nested = 0usize;
+    let mut emitted = 0usize;
+    let mut parameter_index = 0usize;
+    while position <= close - 1 {
+        let at_end = position == close - 1;
+        let byte = signature.get(position).copied().unwrap_or(b',');
+        nested += usize::from(matches!(byte, b'(' | b'[' | b'{' | b'<'));
+        nested = nested.saturating_sub(usize::from(matches!(byte, b')' | b']' | b'}' | b'>')));
+        if (byte == b',' && nested == 0) || at_end {
+            let mut start = parameter_start;
+            let mut end = if at_end { close - 1 } else { position };
+            while start < end && signature[start].is_ascii_whitespace() {
+                start += 1;
+            }
+            while end > start && signature[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            if start < end {
+                let colon = signature[start..end]
+                    .iter()
+                    .position(|&candidate| candidate == b':')
+                    .map(|offset| start + offset);
+                let self_parameter = colon.is_none()
+                    && signature[start..end]
+                        .windows(4)
+                        .any(|candidate| candidate == b"self");
+                if !(skip_self && self_parameter) {
+                    if emitted > 0 {
+                        result.extend_from_slice(b", ");
+                    }
+                    let argument_start = result.len() as u32;
+                    if parameter_index == 0
+                        && let Some(receiver) = receiver
+                    {
+                        if let Some(colon) = colon {
+                            let mut type_start = colon + 1;
+                            while type_start < end && signature[type_start].is_ascii_whitespace() {
+                                type_start += 1;
+                            }
+                            if signature.get(type_start..type_start + 5) == Some(b"&mut ") {
+                                result.extend_from_slice(b"&mut ");
+                            } else if signature.get(type_start) == Some(&b'&') {
+                                result.push(b'&');
+                            }
+                        }
+                        result.extend_from_slice(receiver.as_bytes());
+                    } else if let Some(colon) = colon {
+                        let mut name_start = start;
+                        while name_start < colon
+                            && matches!(signature[name_start], b'&' | b' ' | b'\t')
+                        {
+                            name_start += 1;
+                        }
+                        if signature.get(name_start..name_start + 4) == Some(b"mut ") {
+                            name_start += 4;
+                        }
+                        let mut name_end = colon;
+                        while name_end > name_start && signature[name_end - 1].is_ascii_whitespace()
+                        {
+                            name_end -= 1;
+                        }
+                        let mut type_start = colon + 1;
+                        while type_start < end && signature[type_start].is_ascii_whitespace() {
+                            type_start += 1;
+                        }
+                        if signature.get(type_start..type_start + 5) == Some(b"&mut ") {
+                            result.extend_from_slice(b"&mut ");
+                        } else if signature.get(type_start) == Some(&b'&') {
+                            result.push(b'&');
+                        }
+                        result.extend_from_slice(&signature[name_start..name_end]);
+                    } else {
+                        result.extend_from_slice(&signature[start..end]);
+                    }
+                    let argument_end = result.len() as u32;
+                    if first_selection.is_empty() {
+                        first_selection = argument_start..argument_end;
+                    }
+                    emitted += 1;
+                }
+                parameter_index += 1;
+            }
+            parameter_start = position + 1;
+        }
+        position += 1;
+    }
+    result.push(b')');
+    first_selection
+}
+
 fn editor_refresh_completion(editor: &mut Editor) {
     profiling::function_scope!();
     if editor.mode != Mode::Insert
-        || editor_document(editor)
-            .path
-            .as_deref()
-            .and_then(std::path::Path::extension)
-            .and_then(std::ffi::OsStr::to_str)
-            != Some("rs")
+        || crate::syntax::syntax_language_from_path(editor_document(editor).path.as_deref())
+            != crate::syntax::SyntaxLanguage::Rust
     {
         editor.completion = None;
         return;
@@ -3396,18 +4460,129 @@ fn editor_refresh_completion(editor: &mut Editor) {
         .copied()
         .unwrap_or(editor_document(editor).cursor);
     let mut completion = editor.completion.take().unwrap_or(Completion {
+        bytes: Vec::with_capacity(4096),
         matches: Vec::with_capacity(32),
         selected: 0,
         prefix_start: insertion_point,
+        preview: false,
     });
-    let prefix_start = rust_method_complete(
+    completion.bytes.clear();
+    completion.matches.clear();
+    completion.preview = false;
+    let temp = idno_std::mem().scratch().temp();
+    let mut insertion = temp.vec(128);
+    if let Some((replacement_start, receiver_start, receiver_end)) =
+        rust_postfix_dbg_expression(&editor_document(editor).buffer, insertion_point)
+    {
+        insertion.extend_from_slice(b"dbg!(");
+        for position in receiver_start..receiver_end {
+            insertion.push(buffer_byte(&editor_document(editor).buffer, position));
+        }
+        insertion.push(b')');
+        completion_entry_push(
+            &mut completion,
+            CompletionCandidate {
+                name: "dbg!",
+                detail: "dbg!(value)\nPrints and returns the value without moving it.",
+                insertion: &insertion,
+                selection: 0..0,
+                replacement_start,
+                symbol: u32::MAX,
+                flags: COMPLETION_POSTFIX,
+            },
+        );
+        completion.prefix_start = replacement_start;
+        completion.selected = 0;
+        editor.completion = Some(completion);
+        return;
+    }
+    let mut ranked = temp.vec(64);
+    let method_prefix = rust_method_complete(
         &editor_document(editor).buffer,
         insertion_point,
         &editor.rust_methods.corpus,
-        &mut completion.matches,
+        &mut ranked,
     );
-    let Some(prefix_start) = prefix_start else {
-        return;
+    let mut free_ranked = temp.vec(64);
+    let free_expression = rust_free_function_complete(
+        &editor_document(editor).buffer,
+        insertion_point,
+        &editor.rust_methods.corpus,
+        &mut free_ranked,
+    );
+    let prefix_start = match method_prefix.or(free_expression.map(|expression| expression.0)) {
+        Some(prefix_start) => {
+            for found in ranked.iter().take(32) {
+                let name = rust_method_name(&editor.rust_methods.corpus, found.item);
+                let detail = rust_method_detail(&editor.rust_methods.corpus, found.item);
+                let selection = rust_callable_insertion(name, detail, None, true, &mut insertion);
+                completion_entry_push(
+                    &mut completion,
+                    CompletionCandidate {
+                        name,
+                        detail,
+                        insertion: &insertion,
+                        selection,
+                        replacement_start: prefix_start,
+                        symbol: u32::MAX,
+                        flags: 0,
+                    },
+                );
+            }
+            if let Some((_, receiver_start, receiver_end)) = free_expression {
+                let mut receiver_bytes = temp.vec(receiver_end - receiver_start);
+                for position in receiver_start..receiver_end {
+                    receiver_bytes.push(buffer_byte(&editor_document(editor).buffer, position));
+                }
+                let receiver = std::str::from_utf8(&receiver_bytes).unwrap_or("");
+                for found in free_ranked.iter().take(32) {
+                    let symbol = found.item;
+                    let name = rust_symbol_name(&editor.rust_methods.corpus, symbol);
+                    let detail = rust_symbol_detail(&editor.rust_methods.corpus, symbol);
+                    let selection = rust_callable_insertion(
+                        name,
+                        detail,
+                        Some(receiver),
+                        false,
+                        &mut insertion,
+                    );
+                    completion_entry_push(
+                        &mut completion,
+                        CompletionCandidate {
+                            name,
+                            detail,
+                            insertion: &insertion,
+                            selection,
+                            replacement_start: receiver_start,
+                            symbol: symbol as u32,
+                            flags: 0,
+                        },
+                    );
+                }
+            }
+            prefix_start
+        }
+        None => {
+            let mut prefix_start = insertion_point;
+            while prefix_start > 0
+                && rust_identifier_byte(buffer_byte(
+                    &editor_document(editor).buffer,
+                    prefix_start - 1,
+                ))
+            {
+                prefix_start -= 1;
+            }
+            let reference_completion =
+                rust_reference_completion(&editor_document(editor).buffer, insertion_point);
+            let qualified_completion = insertion_point >= 2
+                && buffer_byte(&editor_document(editor).buffer, insertion_point - 1) == b':'
+                && buffer_byte(&editor_document(editor).buffer, insertion_point - 2) == b':';
+            if prefix_start == insertion_point && !reference_completion && !qualified_completion {
+                return;
+            }
+            editor_collect_name_completions(editor, prefix_start, insertion_point, &mut completion);
+            prefix_start
+        }
     };
     if completion.matches.is_empty() {
         return;
@@ -3419,6 +4594,37 @@ fn editor_refresh_completion(editor: &mut Editor) {
     editor.completion = Some(completion);
 }
 
+fn rust_postfix_dbg_expression(
+    buffer: &GapBuffer,
+    insertion_point: usize,
+) -> Option<(usize, usize, usize)> {
+    const SUFFIX: &[u8] = b".dbg!";
+    if insertion_point < SUFFIX.len()
+        || !SUFFIX.iter().enumerate().all(|(offset, &byte)| {
+            buffer_byte(buffer, insertion_point - SUFFIX.len() + offset) == byte
+        })
+    {
+        return None;
+    }
+    let receiver_end = insertion_point - SUFFIX.len();
+    let mut receiver_start = receiver_end;
+    while receiver_start > 0 && rust_identifier_byte(buffer_byte(buffer, receiver_start - 1)) {
+        receiver_start -= 1;
+    }
+    (receiver_start < receiver_end).then_some((receiver_start, receiver_start, receiver_end))
+}
+
+fn rust_reference_completion(buffer: &GapBuffer, insertion_point: usize) -> bool {
+    if insertion_point > 0 && buffer_byte(buffer, insertion_point - 1) == b'&' {
+        return true;
+    }
+    if insertion_point < 5 {
+        return false;
+    }
+    let start = insertion_point - 5;
+    (0..5).all(|offset| buffer_byte(buffer, start + offset) == b"&mut "[offset])
+}
+
 fn editor_accept_completion(editor: &mut Editor) {
     profiling::function_scope!();
     let Some(completion) = editor.completion.take() else {
@@ -3428,16 +4634,17 @@ fn editor_accept_completion(editor: &mut Editor) {
         return;
     };
     let temp = idno_std::mem().scratch().temp();
-    let name = rust_method_name(&editor.rust_methods.corpus, found.item);
-    let mut inserted = temp.vec(name.len());
-    inserted.extend_from_slice(name.as_bytes());
-    let document = editor_document_mut(editor);
-    let primary = document
+    let insertion = completion_insertion(&completion, *found);
+    let mut inserted = temp.vec(insertion.len());
+    inserted.extend_from_slice(insertion);
+    let primary_before_import = editor_document(editor)
         .insertion_points
         .last()
         .copied()
-        .unwrap_or(document.cursor);
-    let prefix_length = primary.saturating_sub(completion.prefix_start);
+        .unwrap_or(editor_document(editor).cursor);
+    let prefix_length = primary_before_import.saturating_sub(found.replacement_start);
+    editor_insert_completion_import(editor, found.symbol);
+    let document = editor_document_mut(editor);
     let mut replacements = temp.vec(document.insertion_points.len());
     for &position in &document.insertion_points {
         replacements.push(Replacement {
@@ -3446,7 +4653,372 @@ fn editor_accept_completion(editor: &mut Editor) {
             inserted: 0..inserted.len(),
         });
     }
-    document_replace_ranges(document, &mut replacements, &inserted, None);
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    let mut after = temp.vec(replacements.len());
+    let mut insertion_points = temp.vec(replacements.len());
+    let mut shift = 0isize;
+    for replacement in &replacements {
+        let after_start = (replacement.start as isize + shift) as usize;
+        let selection_start = after_start + found.selection_start as usize;
+        let selection_end = after_start + found.selection_end as usize;
+        let cursor = if selection_end > selection_start {
+            selection_end - 1
+        } else {
+            after_start + inserted.len()
+        };
+        after.push(SelectionState {
+            anchor: selection_start,
+            cursor,
+        });
+        insertion_points.push(if selection_end > selection_start {
+            selection_start
+        } else {
+            after_start + inserted.len()
+        });
+        shift += inserted.len() as isize - (replacement.end - replacement.start) as isize;
+    }
+    document_replace_ranges(document, &mut replacements, &inserted, Some(&after));
+    document.insertion_points.clear();
+    document
+        .insertion_points
+        .extend_from_slice(&insertion_points);
+}
+
+fn editor_insert_completion_import(editor: &mut Editor, symbol: u32) {
+    profiling::function_scope!();
+    if symbol == u32::MAX {
+        return;
+    }
+    let symbol = symbol as usize;
+    let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+        return;
+    };
+    if editor_document(editor).path.as_deref() == Some(path) {
+        return;
+    }
+    let temp = idno_std::mem().scratch().temp();
+    let mut module = temp.vec(64);
+    let relative = path.strip_prefix(&editor.project.root).unwrap_or(path);
+    let file_name = relative.file_name();
+    let mut after_source = false;
+    for component in relative.components() {
+        let component_name = component.as_os_str();
+        let bytes = component_name.as_encoded_bytes();
+        if bytes == b"src" {
+            module.clear();
+            module.extend_from_slice(b"crate");
+            after_source = true;
+            continue;
+        }
+        if !after_source {
+            continue;
+        }
+        let file = file_name == Some(component_name);
+        let mut component_bytes = bytes;
+        if file && let Some(dot) = component_bytes.iter().rposition(|&byte| byte == b'.') {
+            component_bytes = &component_bytes[..dot];
+        }
+        if file && matches!(component_bytes, b"lib" | b"main" | b"mod") {
+            continue;
+        }
+        module.extend_from_slice(b"::");
+        module.extend_from_slice(component_bytes);
+    }
+    if !after_source || module.is_empty() {
+        return;
+    }
+    let symbol_name = rust_symbol_name(&editor.rust_methods.corpus, symbol).as_bytes();
+    let mut name = temp.vec(symbol_name.len());
+    name.extend_from_slice(symbol_name);
+    let document = editor_document_mut(editor);
+    let mut line_start = 0usize;
+    let mut insertion_point = 0usize;
+    while line_start < buffer_len(&document.buffer) {
+        let line_end = buffer_line_end(&document.buffer, line_start);
+        let mut text = line_start;
+        while text < line_end && buffer_byte(&document.buffer, text).is_ascii_whitespace() {
+            text += 1;
+        }
+        let use_line = buffer_range_matches_identifier(&document.buffer, text, line_end, b"use");
+        let top_level_prefix = use_line
+            || buffer_range_matches_identifier(&document.buffer, text, line_end, b"mod")
+            || text == line_end
+            || (text + 1 < line_end
+                && buffer_byte(&document.buffer, text) == b'#'
+                && buffer_byte(&document.buffer, text + 1) == b'!')
+            || (text + 2 < line_end
+                && buffer_byte(&document.buffer, text) == b'/'
+                && buffer_byte(&document.buffer, text + 1) == b'/'
+                && buffer_byte(&document.buffer, text + 2) == b'!');
+        if !top_level_prefix {
+            break;
+        }
+        if use_line && buffer_line_contains_identifier(&document.buffer, text + 3, line_end, &name)
+        {
+            return;
+        }
+        insertion_point = if line_end < buffer_len(&document.buffer) {
+            line_end + 1
+        } else {
+            line_end
+        };
+        line_start = line_end.saturating_add(1);
+    }
+    let mut import = temp.vec(module.len() + name.len() + 9);
+    import.extend_from_slice(b"use ");
+    import.extend_from_slice(&module);
+    import.extend_from_slice(b"::");
+    import.extend_from_slice(&name);
+    import.extend_from_slice(b";\n");
+    let mut replacements = temp.vec(1);
+    replacements.push(Replacement {
+        start: insertion_point,
+        end: insertion_point,
+        inserted: 0..import.len(),
+    });
+    document_replace_ranges(document, &mut replacements, &import, None);
+}
+
+fn buffer_line_contains_identifier(
+    buffer: &GapBuffer,
+    start: usize,
+    end: usize,
+    name: &[u8],
+) -> bool {
+    if name.is_empty() || end.saturating_sub(start) < name.len() {
+        return false;
+    }
+    (start..=end - name.len())
+        .any(|position| buffer_range_matches_identifier(buffer, position, end, name))
+}
+
+fn editor_collect_name_completions(
+    editor: &mut Editor,
+    prefix_start: usize,
+    insertion_point: usize,
+    completion: &mut Completion,
+) {
+    profiling::function_scope!();
+    {
+        let document = editor_document_mut(editor);
+        while !document.code_index.complete {
+            code_index_step(
+                &document.buffer,
+                &mut document.code_index,
+                256 * 1024,
+                std::time::Duration::MAX,
+            );
+        }
+    }
+    let temp = idno_std::mem().scratch().temp();
+    let mut query_bytes = temp.vec(insertion_point - prefix_start);
+    for position in prefix_start..insertion_point {
+        query_bytes.push(buffer_byte(&editor_document(editor).buffer, position));
+    }
+    let query = match std::str::from_utf8(&query_bytes) {
+        Ok(query) => query,
+        Err(_) => return,
+    };
+    let mut qualifier = temp.vec(32);
+    if prefix_start >= 2
+        && buffer_byte(&editor_document(editor).buffer, prefix_start - 1) == b':'
+        && buffer_byte(&editor_document(editor).buffer, prefix_start - 2) == b':'
+    {
+        let mut start = prefix_start - 2;
+        while start > 0
+            && rust_identifier_byte(buffer_byte(&editor_document(editor).buffer, start - 1))
+        {
+            start -= 1;
+        }
+        for position in start..prefix_start - 2 {
+            qualifier.push(buffer_byte(&editor_document(editor).buffer, position));
+        }
+    }
+
+    let document = editor_document(editor);
+    let mut local_bytes = temp.vec(1024);
+    let mut local_ranges = temp.vec(document.code_index.symbols.len());
+    for symbol in &document.code_index.symbols {
+        if !qualifier.is_empty() {
+            break;
+        }
+        let Some(identifier) = document
+            .code_index
+            .identifiers
+            .get(symbol.identifier as usize)
+        else {
+            continue;
+        };
+        if identifier.start as usize >= insertion_point {
+            continue;
+        }
+        let start = local_bytes.len();
+        for position in identifier.start as usize..identifier.end as usize {
+            local_bytes.push(buffer_byte(&document.buffer, position));
+        }
+        local_ranges.push(start..local_bytes.len());
+    }
+    let mut labels = temp.vec(local_ranges.len());
+    for range in &local_ranges {
+        labels.push(std::str::from_utf8(&local_bytes[range.clone()]).unwrap_or(""));
+    }
+    let mut local_matches = temp.vec(local_ranges.len());
+    fuzzy_rank(query, &labels, &mut local_matches);
+    for found in local_matches.iter().take(32) {
+        let name = labels[found.item];
+        completion_entry_push(
+            completion,
+            CompletionCandidate {
+                name,
+                detail: "local",
+                insertion: name.as_bytes(),
+                selection: 0..0,
+                replacement_start: prefix_start,
+                symbol: u32::MAX,
+                flags: 0,
+            },
+        );
+    }
+
+    for &keyword in RUST_COMPLETION_KEYWORDS {
+        if !qualifier.is_empty() {
+            break;
+        }
+        if slice_starts_with_smart_case(keyword.as_bytes(), query.as_bytes()) {
+            completion_entry_push(
+                completion,
+                CompletionCandidate {
+                    name: keyword,
+                    detail: "Rust keyword",
+                    insertion: keyword.as_bytes(),
+                    selection: 0..0,
+                    replacement_start: prefix_start,
+                    symbol: u32::MAX,
+                    flags: 0,
+                },
+            );
+        }
+    }
+
+    let mut symbol_labels = temp.vec(256);
+    let mut symbol_indices = temp.vec(256);
+    let namespace_root = if qualifier.is_empty() {
+        None
+    } else {
+        rust_namespace_root(&editor.rust_methods.corpus, &qualifier)
+    };
+    for symbol in 0..editor.rust_methods.corpus.symbols.len() {
+        let label = rust_symbol_name(&editor.rust_methods.corpus, symbol);
+        let qualified_match = qualifier.is_empty()
+            || rust_symbol_owner(&editor.rust_methods.corpus, symbol).as_bytes() == qualifier
+            || rust_symbol_path(&editor.rust_methods.corpus, symbol).is_some_and(|path| {
+                rust_path_module_matches(path, &qualifier)
+                    || namespace_root.is_some_and(|root| path.starts_with(root))
+            });
+        if qualified_match && slice_starts_with_smart_case(label.as_bytes(), query.as_bytes()) {
+            symbol_labels.push(label);
+            symbol_indices.push(symbol);
+        }
+    }
+    let mut symbol_matches = temp.vec(symbol_labels.len());
+    fuzzy_rank(query, &symbol_labels, &mut symbol_matches);
+    let mut insertion = temp.vec(128);
+    for found in symbol_matches.iter().take(64) {
+        let symbol = symbol_indices[found.item];
+        let label = symbol_labels[found.item];
+        let detail = rust_symbol_detail(&editor.rust_methods.corpus, symbol);
+        let detail = if detail.is_empty() {
+            rust_symbol_path(&editor.rust_methods.corpus, symbol)
+                .and_then(std::path::Path::to_str)
+                .unwrap_or("symbol")
+        } else {
+            detail
+        };
+        let selection = rust_callable_insertion(label, detail, None, false, &mut insertion);
+        completion_entry_push(
+            completion,
+            CompletionCandidate {
+                name: label,
+                detail,
+                insertion: &insertion,
+                selection,
+                replacement_start: prefix_start,
+                symbol: if qualifier.is_empty() {
+                    symbol as u32
+                } else {
+                    u32::MAX
+                },
+                flags: 0,
+            },
+        );
+        if completion.matches.len() >= 32 {
+            break;
+        }
+    }
+}
+
+fn slice_starts_with_smart_case(candidate: &[u8], prefix: &[u8]) -> bool {
+    candidate.len() >= prefix.len()
+        && prefix
+            .iter()
+            .zip(candidate)
+            .all(|(&query, &candidate)| fuzzy_byte_matches(query, candidate))
+}
+
+fn completion_entry_push(completion: &mut Completion, candidate: CompletionCandidate<'_>) {
+    if candidate.name.is_empty()
+        || completion.matches.iter().any(|entry| {
+            &completion.bytes[entry.name_start as usize..entry.name_end as usize]
+                == candidate.name.as_bytes()
+        })
+        || completion.bytes.len()
+            + candidate.name.len()
+            + candidate.detail.len()
+            + candidate.insertion.len()
+            > u32::MAX as usize
+    {
+        return;
+    }
+    let name_start = completion.bytes.len() as u32;
+    completion
+        .bytes
+        .extend_from_slice(candidate.name.as_bytes());
+    let name_end = completion.bytes.len() as u32;
+    let detail_start = name_end;
+    completion
+        .bytes
+        .extend_from_slice(candidate.detail.as_bytes());
+    let detail_end = completion.bytes.len() as u32;
+    let insertion_start = detail_end;
+    completion.bytes.extend_from_slice(candidate.insertion);
+    let insertion_end = completion.bytes.len() as u32;
+    completion.matches.push(CompletionEntry {
+        name_start,
+        name_end,
+        detail_start,
+        detail_end,
+        insertion_start,
+        insertion_end,
+        selection_start: candidate.selection.start,
+        selection_end: candidate.selection.end,
+        replacement_start: candidate.replacement_start,
+        symbol: candidate.symbol,
+        flags: candidate.flags,
+    });
+}
+
+fn completion_name(completion: &Completion, entry: CompletionEntry) -> &str {
+    std::str::from_utf8(&completion.bytes[entry.name_start as usize..entry.name_end as usize])
+        .unwrap_or("")
+}
+
+fn completion_detail(completion: &Completion, entry: CompletionEntry) -> &str {
+    std::str::from_utf8(&completion.bytes[entry.detail_start as usize..entry.detail_end as usize])
+        .unwrap_or("")
+}
+
+fn completion_insertion(completion: &Completion, entry: CompletionEntry) -> &[u8] {
+    &completion.bytes[entry.insertion_start as usize..entry.insertion_end as usize]
 }
 
 fn editor_enter_insert(editor: &mut Editor, after: bool) {
@@ -3614,6 +5186,20 @@ fn editor_paste_register(editor: &mut Editor, after: bool) {
     editor_paste_values(editor, &bytes, &values, after);
 }
 
+fn editor_replace_register(editor: &mut Editor) {
+    profiling::function_scope!();
+    if editor.register.values.is_empty() {
+        editor.status.push_str("register is empty");
+        return;
+    }
+    let temp = idno_std::mem().scratch().temp();
+    let mut bytes = temp.vec(editor.register.bytes.len());
+    bytes.extend_from_slice(&editor.register.bytes);
+    let mut values = temp.vec(editor.register.values.len());
+    values.extend(editor.register.values.iter().cloned());
+    editor_replace_values(editor, &bytes, &values);
+}
+
 fn editor_paste_values(
     editor: &mut Editor,
     bytes: &[u8],
@@ -3635,6 +5221,7 @@ fn editor_paste_values(
     let temp = idno_std::mem().scratch().temp();
     let mut selections = temp.vec(document.secondary_selections.len() + 1);
     document_selections(document, &mut selections);
+    selections.sort_unstable_by_key(|selection| selection.anchor.min(selection.cursor));
     let mut replacements = temp.vec(selections.len());
     for (selection_index, selection) in selections.iter().enumerate() {
         let position = if after {
@@ -3690,8 +5277,72 @@ fn editor_paste_system(editor: &mut Editor) {
     if let Some(task) = editor.clipboard_paste_task.take() {
         task.cancel();
     }
+    editor.clipboard_paste_replaces = false;
     editor.clipboard_paste_task = Some(idno_std::threads().spawn_owned(clipboard_read));
     editor.status.push_str("reading system clipboard");
+}
+
+fn editor_replace_system(editor: &mut Editor) {
+    profiling::function_scope!();
+    if let Some(task) = editor.clipboard_paste_task.take() {
+        task.cancel();
+    }
+    editor.clipboard_paste_replaces = true;
+    editor.clipboard_paste_task = Some(idno_std::threads().spawn_owned(clipboard_read));
+    editor.status.push_str("reading system clipboard");
+}
+
+fn editor_replace_selections(editor: &mut Editor, bytes: &[u8]) {
+    profiling::function_scope!();
+    let value = 0..bytes.len() as u32;
+    editor_replace_values(editor, bytes, std::slice::from_ref(&value));
+}
+
+fn editor_replace_values(editor: &mut Editor, bytes: &[u8], values: &[std::ops::Range<u32>]) {
+    profiling::function_scope!();
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|value| value.start > value.end || value.end as usize > bytes.len())
+    {
+        editor.status.push_str("invalid replace register");
+        return;
+    }
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    selections.sort_unstable_by_key(|selection| selection.anchor.min(selection.cursor));
+    let mut replacements = temp.vec(selections.len());
+    for (selection_index, selection) in selections.iter().enumerate() {
+        let value = values[selection_index % values.len()].clone();
+        replacements.push(Replacement {
+            start: selection.anchor.min(selection.cursor),
+            end: buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor)),
+            inserted: value.start as usize..value.end as usize,
+        });
+    }
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    let mut replaced = temp.vec(replacements.len());
+    for replacement in &replacements {
+        let start = offset_after_replacements(replacement.start, false, &replacements);
+        let end = start + replacement.inserted.len();
+        let mut last_character = replacement.inserted.end.saturating_sub(1);
+        while last_character > replacement.inserted.start
+            && bytes[last_character] & 0b1100_0000 == 0b1000_0000
+        {
+            last_character -= 1;
+        }
+        replaced.push(SelectionState {
+            anchor: start,
+            cursor: if end > start {
+                start + last_character - replacement.inserted.start
+            } else {
+                start
+            },
+        });
+    }
+    document_replace_ranges(document, &mut replacements, bytes, Some(&replaced));
 }
 
 fn editor_poll_clipboard(editor: &mut Editor) -> bool {
@@ -3734,7 +5385,11 @@ fn editor_poll_clipboard(editor: &mut Editor) -> bool {
         return true;
     }
     let range = 0..paste.bytes.len() as u32;
-    editor_paste_values(editor, &paste.bytes, std::slice::from_ref(&range), true);
+    if editor.clipboard_paste_replaces {
+        editor_replace_selections(editor, &paste.bytes);
+    } else {
+        editor_paste_values(editor, &paste.bytes, std::slice::from_ref(&range), true);
+    }
     true
 }
 
@@ -3841,22 +5496,48 @@ fn editor_select_current_lines(editor: &mut Editor) {
 }
 
 fn editor_select_word_motion(editor: &mut Editor, forward: bool) {
-    let was_normal = editor.mode == Mode::Normal;
+    let normal = editor.mode == Mode::Normal;
     let document = editor_document_mut(editor);
     let temp = idno_std::mem().scratch().temp();
     let mut selections = temp.vec(document.secondary_selections.len() + 1);
     document_selections(document, &mut selections);
     for selection in &mut selections {
-        if was_normal {
-            selection.anchor = selection.cursor;
-        }
-        selection.cursor = if forward {
-            buffer_next_word_start(&document.buffer, selection.cursor)
+        if forward {
+            let start = if normal && selection.anchor != selection.cursor {
+                buffer_next_char(&document.buffer, selection.cursor)
+            } else {
+                selection.cursor
+            };
+            let boundary = buffer_next_word_start(&document.buffer, start);
+            if normal {
+                selection.anchor = start;
+            }
+            selection.cursor = if boundary > start {
+                buffer_previous_char(&document.buffer, boundary)
+            } else {
+                start
+            };
         } else {
-            buffer_previous_word_start(&document.buffer, selection.cursor)
-        };
+            let origin = selection.cursor;
+            let target = buffer_previous_word_start(&document.buffer, origin);
+            if normal {
+                let current_word_start = buffer_previous_word_start(
+                    &document.buffer,
+                    buffer_next_char(&document.buffer, origin),
+                );
+                selection.anchor = if current_word_start == target {
+                    origin
+                } else {
+                    buffer_previous_char(&document.buffer, origin)
+                };
+            }
+            selection.cursor = target;
+        }
         if selection.cursor == buffer_len(&document.buffer) && selection.cursor > 0 {
             selection.cursor = buffer_previous_char(&document.buffer, selection.cursor);
+        }
+        if normal && selection.anchor == buffer_len(&document.buffer) {
+            selection.anchor = selection.cursor;
         }
     }
     document_set_selections(document, &selections);
@@ -3903,10 +5584,19 @@ fn editor_insert_newline(editor: &mut Editor) {
     let mut inserted_bytes = temp.vec(document.insertion_points.len() * (indentation_spaces + 1));
     let mut indentation = temp.vec(indentation_spaces);
     let mut outer_indentation = temp.vec(indentation_spaces);
-    let mut original_points = temp.vec(document.insertion_points.len());
+    let mut replacement_starts = temp.vec(document.insertion_points.len());
     let mut cursor_offsets = temp.vec(document.insertion_points.len());
     for &position in &document.insertion_points {
-        original_points.push(position);
+        let line_start = buffer_line_start(&document.buffer, position);
+        let indentation_only_before_cursor = line_start < position
+            && (line_start..position).all(|byte_position| {
+                matches!(buffer_byte(&document.buffer, byte_position), b' ' | b'\t')
+            });
+        replacement_starts.push(if indentation_only_before_cursor {
+            line_start
+        } else {
+            position
+        });
         indentation.clear();
         if auto_indentation {
             indentation_for_position(
@@ -3914,6 +5604,7 @@ fn editor_insert_newline(editor: &mut Editor) {
                 position,
                 scope_indentation,
                 indentation_spaces,
+                syntax_highlighting_spans(&document.syntax),
                 &mut indentation,
             );
         }
@@ -3938,6 +5629,7 @@ fn editor_insert_newline(editor: &mut Editor) {
                     position,
                     false,
                     indentation_spaces,
+                    syntax_highlighting_spans(&document.syntax),
                     &mut outer_indentation,
                 );
             }
@@ -3945,14 +5637,18 @@ fn editor_insert_newline(editor: &mut Editor) {
             inserted_bytes.extend_from_slice(&outer_indentation);
         }
         replacements.push(Replacement {
-            start: position,
+            start: if indentation_only_before_cursor {
+                line_start
+            } else {
+                position
+            },
             end: position,
             inserted: inserted_start..inserted_bytes.len(),
         });
     }
     document_replace_ranges(document, &mut replacements, &inserted_bytes, None);
     document.insertion_points.clear();
-    for (&position, &cursor_offset) in original_points.iter().zip(&cursor_offsets) {
+    for (&position, &cursor_offset) in replacement_starts.iter().zip(&cursor_offsets) {
         document
             .insertion_points
             .push(offset_after_replacements(position, false, &replacements) + cursor_offset);
@@ -3988,6 +5684,7 @@ fn editor_open_line_below(editor: &mut Editor) {
                 position,
                 scope_indentation,
                 indentation_spaces,
+                syntax_highlighting_spans(&document.syntax),
                 &mut indentation,
             );
         }
@@ -4045,6 +5742,7 @@ fn editor_open_line_above(editor: &mut Editor) {
                 position,
                 false,
                 indentation_spaces,
+                syntax_highlighting_spans(&document.syntax),
                 &mut indentation,
             );
         }
@@ -4148,8 +5846,10 @@ fn indentation_for_position(
     position: usize,
     scope_indentation: bool,
     indentation_spaces: usize,
+    syntax_spans: &[SyntaxSpan],
     indentation: &mut Vec<u8, impl Allocator>,
 ) {
+    profiling::function_scope!();
     let start = buffer_line_start(buffer, position);
     let end = buffer_line_end(buffer, position);
     indentation.clear();
@@ -4158,14 +5858,95 @@ fn indentation_for_position(
         indentation.push(buffer_byte(buffer, at));
         at += 1;
     }
-    if scope_indentation {
-        let mut last = position.min(end);
-        while last > start && matches!(buffer_byte(buffer, last - 1), b' ' | b'\t') {
-            last -= 1;
+    if !scope_indentation {
+        return;
+    }
+
+    let mut round_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut curly_depth = 0usize;
+    let mut at = position.min(buffer_len(buffer));
+    let mut span_position = syntax_spans.partition_point(|span| (span.start as usize) < at);
+    while at > 0 {
+        let byte_position = at - 1;
+        while span_position > 0 && syntax_spans[span_position - 1].start as usize > byte_position {
+            span_position -= 1;
         }
-        if last > start && matches!(buffer_byte(buffer, last - 1), b'(' | b'[' | b'{') {
+        if span_position > 0 {
+            let span = syntax_spans[span_position - 1];
+            if span.start as usize <= byte_position
+                && byte_position < span.end as usize
+                && matches!(
+                    span.kind,
+                    SyntaxKind::Comment
+                        | SyntaxKind::String
+                        | SyntaxKind::Markup
+                        | SyntaxKind::CommentAnnotation
+                        | SyntaxKind::CommentNote
+                        | SyntaxKind::CommentWarning
+                        | SyntaxKind::CommentError
+                )
+            {
+                at = span.start as usize;
+                span_position -= 1;
+                continue;
+            }
+        }
+        let byte = buffer_byte(buffer, byte_position);
+        let unmatched_opening = match byte {
+            b')' => {
+                round_depth += 1;
+                false
+            }
+            b']' => {
+                square_depth += 1;
+                false
+            }
+            b'}' => {
+                curly_depth += 1;
+                false
+            }
+            b'(' if round_depth > 0 => {
+                round_depth -= 1;
+                false
+            }
+            b'[' if square_depth > 0 => {
+                square_depth -= 1;
+                false
+            }
+            b'{' if curly_depth > 0 => {
+                curly_depth -= 1;
+                false
+            }
+            b'(' | b'[' | b'{' => true,
+            _ => false,
+        };
+        if unmatched_opening {
+            let scope_start = buffer_line_start(buffer, byte_position);
+            let mut whitespace = scope_start;
+            while whitespace < byte_position
+                && matches!(buffer_byte(buffer, whitespace), b' ' | b'\t')
+            {
+                whitespace += 1;
+            }
+            let scope_indentation_length = whitespace - scope_start + indentation_spaces;
+            let mut last = position.min(end);
+            while last > start && matches!(buffer_byte(buffer, last - 1), b' ' | b'\t') {
+                last -= 1;
+            }
+            let line_continues =
+                last > start && !matches!(buffer_byte(buffer, last - 1), b';' | b'{' | b'}');
+            if line_continues && indentation.len() > scope_indentation_length {
+                return;
+            }
+            indentation.clear();
+            for position in scope_start..whitespace {
+                indentation.push(buffer_byte(buffer, position));
+            }
             indentation.extend(std::iter::repeat_n(b' ', indentation_spaces));
+            return;
         }
+        at = byte_position;
     }
 }
 
@@ -4196,6 +5977,200 @@ fn editor_select_surrounding(editor: &mut Editor, delimiter: char, inside: bool)
         };
     }
     document_set_selections(document, &selections);
+}
+
+fn editor_goto_argument(editor: &mut Editor, forward: bool) {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    let mut arguments = temp.vec(16);
+    document_selections(document, &mut selections);
+    for selection in &mut selections {
+        let mut surrounding = None;
+        for (opening, closing) in [(b'(', b')'), (b'[', b']'), (b'{', b'}')] {
+            if let Some(range) =
+                surrounding_range(&document.buffer, selection.cursor, opening, closing)
+                && surrounding
+                    .is_none_or(|current: (usize, usize)| range.1 - range.0 < current.1 - current.0)
+            {
+                surrounding = Some(range);
+            }
+        }
+        if surrounding.is_none() && forward {
+            let mut position = selection.cursor;
+            while position < buffer_len(&document.buffer) {
+                let byte = buffer_byte(&document.buffer, position);
+                let closing = match byte {
+                    b'(' => b')',
+                    b'[' => b']',
+                    b'{' => b'}',
+                    _ => {
+                        position += 1;
+                        continue;
+                    }
+                };
+                surrounding = surrounding_range(&document.buffer, position, byte, closing);
+                break;
+            }
+        }
+        let Some((open, close)) = surrounding else {
+            continue;
+        };
+        rust_argument_ranges(&document.buffer, open, close, &mut arguments);
+        let target = if forward {
+            arguments
+                .iter()
+                .find(|range| range.start > selection.cursor)
+                .or_else(|| {
+                    arguments
+                        .iter()
+                        .find(|range| range.contains(&selection.cursor))
+                        .and_then(|current| {
+                            arguments.iter().find(|range| range.start > current.start)
+                        })
+                })
+        } else {
+            arguments
+                .iter()
+                .rev()
+                .find(|range| range.end.saturating_sub(1) < selection.cursor)
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        selection.anchor = target.start;
+        selection.cursor = target.end.saturating_sub(1);
+    }
+    document_set_selections(document, &selections);
+}
+
+fn rust_argument_ranges(
+    buffer: &GapBuffer,
+    open: usize,
+    close: usize,
+    result: &mut Vec<std::ops::Range<usize>, impl Allocator>,
+) {
+    profiling::function_scope!();
+    result.clear();
+    let mut start = open + 1;
+    let mut position = start;
+    let mut round = 0usize;
+    let mut square = 0usize;
+    let mut curly = 0usize;
+    let mut angle = 0usize;
+    while position <= close {
+        let byte = if position < close {
+            buffer_byte(buffer, position)
+        } else {
+            b','
+        };
+        let separator = byte == b',' && round == 0 && square == 0 && curly == 0 && angle == 0;
+        if separator {
+            let mut argument_start = start;
+            let mut argument_end = position;
+            while argument_start < argument_end
+                && buffer_byte(buffer, argument_start).is_ascii_whitespace()
+            {
+                argument_start += 1;
+            }
+            while argument_end > argument_start
+                && buffer_byte(buffer, argument_end - 1).is_ascii_whitespace()
+            {
+                argument_end -= 1;
+            }
+            if argument_start < argument_end {
+                result.push(argument_start..argument_end);
+            }
+            start = position + 1;
+        } else {
+            match byte {
+                b'(' => round += 1,
+                b')' => round = round.saturating_sub(1),
+                b'[' => square += 1,
+                b']' => square = square.saturating_sub(1),
+                b'{' => curly += 1,
+                b'}' => curly = curly.saturating_sub(1),
+                b'<' => angle += 1,
+                b'>' => angle = angle.saturating_sub(1),
+                _ => {}
+            }
+        }
+        position += 1;
+    }
+}
+
+fn editor_add_surround(editor: &mut Editor, delimiter: char) {
+    profiling::function_scope!();
+    if !delimiter.is_ascii() {
+        return;
+    }
+    let (opening, closing) = delimiter_pair(delimiter as u8);
+    let inserted = [opening, closing];
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    let mut replacements = temp.vec((document.secondary_selections.len() + 1) * 2);
+    document_selections(document, &mut selections);
+    for selection in &selections {
+        let start = selection.anchor.min(selection.cursor);
+        let end = buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor));
+        replacements.push(Replacement {
+            start,
+            end: start,
+            inserted: 0..1,
+        });
+        replacements.push(Replacement {
+            start: end,
+            end,
+            inserted: 1..2,
+        });
+    }
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    let mut after = temp.vec(selections.len());
+    for selection in &selections {
+        after.push(SelectionState {
+            anchor: offset_after_replacements(selection.anchor, true, &replacements),
+            cursor: offset_after_replacements(selection.cursor, true, &replacements),
+        });
+    }
+    document_replace_ranges(document, &mut replacements, &inserted, Some(&after));
+}
+
+fn editor_replace_surround(editor: &mut Editor, from: char, to: char) {
+    profiling::function_scope!();
+    if !from.is_ascii() || !to.is_ascii() {
+        return;
+    }
+    let (from_opening, from_closing) = delimiter_pair(from as u8);
+    let (to_opening, to_closing) = delimiter_pair(to as u8);
+    let inserted = [to_opening, to_closing];
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    let mut replacements = temp.vec((document.secondary_selections.len() + 1) * 2);
+    document_selections(document, &mut selections);
+    for selection in &selections {
+        let Some((start, end)) = surrounding_range(
+            &document.buffer,
+            selection.cursor,
+            from_opening,
+            from_closing,
+        ) else {
+            continue;
+        };
+        replacements.push(Replacement {
+            start,
+            end: start + 1,
+            inserted: 0..1,
+        });
+        replacements.push(Replacement {
+            start: end,
+            end: end + 1,
+            inserted: 1..2,
+        });
+    }
+    document_replace_ranges(document, &mut replacements, &inserted, Some(&selections));
 }
 
 #[derive(Clone, Copy)]
@@ -4575,33 +6550,77 @@ fn editor_goto_diagnostic(editor: &mut Editor, diagnostic: usize) {
         return;
     };
     let path = diagnostic.path.clone();
-    let line = diagnostic.line as usize;
-    let column = diagnostic.column as usize;
+    let diagnostic_range = (
+        diagnostic.line as usize,
+        diagnostic.column as usize,
+        diagnostic.end_line as usize,
+        diagnostic.end_column as usize,
+    );
     let before = editor_location(editor);
     let Some(target) = editor_document_target(editor, path) else {
         return;
     };
     editor_switch_document_state(editor, target);
-    let start = buffer_position_at_line_column(&editor_document(editor).buffer, line, column);
-    let end = buffer_next_char(&editor_document(editor).buffer, start);
+    let document = editor_document(editor);
+    let start = buffer_position_at_line_character_column(
+        &document.buffer,
+        diagnostic_range.0,
+        diagnostic_range.1,
+    );
+    let mut end = buffer_position_at_line_character_column(
+        &document.buffer,
+        diagnostic_range.2,
+        diagnostic_range.3,
+    );
+    if end <= start {
+        end = buffer_next_char(&document.buffer, start);
+    }
     editor_set_symbol_selection(editor, start, end);
     editor_center_view(editor);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
 }
 
+fn buffer_position_at_line_character_column(
+    buffer: &GapBuffer,
+    line: usize,
+    column: usize,
+) -> usize {
+    profiling::function_scope!();
+    let mut position = buffer_position_at_line_column(buffer, line, 0);
+    let end = buffer_line_end(buffer, position);
+    for _ in 0..column {
+        if position >= end {
+            break;
+        }
+        position = buffer_next_char(buffer, position);
+    }
+    position
+}
+
 fn editor_goto_definition(editor: &mut Editor) {
     profiling::function_scope!();
+    if !editor_document(editor).code_index.enabled {
+        editor
+            .status
+            .push_str("definition provider unavailable for this language");
+        return;
+    }
+    editor_finish_workspace_refresh(editor);
     let temp = idno_std::mem().scratch().temp();
     let mut name = temp.vec(64);
-    let local_target = {
+    let mut owner = temp.vec(64);
+    let mut glob_owners = temp.vec(64);
+    let (local_target, module_target, qualified_path, on_module_definition, follow_type_alias) = {
         let document = editor_document_mut(editor);
-        code_index_step(
-            &document.buffer,
-            &mut document.code_index,
-            256 * 1024,
-            std::time::Duration::from_micros(500),
-        );
+        while !document.code_index.complete {
+            code_index_step(
+                &document.buffer,
+                &mut document.code_index,
+                256 * 1024,
+                std::time::Duration::MAX,
+            );
+        }
         let Some(identifier_index) =
             code_index_identifier_at(&document.code_index, document.cursor)
         else {
@@ -4612,26 +6631,342 @@ fn editor_goto_definition(editor: &mut Editor) {
         for position in identifier_range.start as usize..identifier_range.end as usize {
             name.push(buffer_byte(&document.buffer, position));
         }
-        code_index_definition_for(&document.buffer, &document.code_index, identifier_index).map(
-            |symbol| {
-                let symbol = document.code_index.symbols[symbol];
-                let identifier = document.code_index.identifiers[symbol.identifier as usize];
-                (
-                    identifier.start as usize,
-                    identifier.end as usize,
-                    symbol.kind,
-                )
-            },
+        rust_qualified_owner(
+            &document.buffer,
+            identifier_range.start as usize,
+            &mut owner,
+        );
+        if owner.is_empty() {
+            rust_import_owner(
+                &document.buffer,
+                &document.code_index,
+                identifier_index,
+                &mut owner,
+            );
+        }
+        rust_glob_import_owners(
+            &document.buffer,
+            identifier_range.start as usize,
+            &mut glob_owners,
+        );
+        let qualified_path =
+            rust_path_separator_after(&document.buffer, identifier_range.end as usize);
+        let target =
+            code_index_definition_for(&document.buffer, &document.code_index, identifier_index)
+                .map(|symbol| {
+                    let symbol = document.code_index.symbols[symbol];
+                    let identifier = document.code_index.identifiers[symbol.identifier as usize];
+                    (
+                        identifier.start as usize,
+                        identifier.end as usize,
+                        symbol.kind,
+                    )
+                });
+        let module_target = code_index_definition_of_kind(
+            &document.buffer,
+            &document.code_index,
+            identifier_index,
+            CodeSymbolKind::Module,
+        )
+        .map(|symbol| {
+            let symbol = document.code_index.symbols[symbol];
+            let identifier = document.code_index.identifiers[symbol.identifier as usize];
+            (identifier.start as usize, identifier.end as usize)
+        });
+        let on_module_definition = module_target.is_some_and(|(start, end)| {
+            start == identifier_range.start as usize && end == identifier_range.end as usize
+        });
+        let follow_type_alias = target.is_some_and(|(start, end, kind)| {
+            kind == CodeSymbolKind::Type
+                && start == identifier_range.start as usize
+                && end == identifier_range.end as usize
+        }) && rust_type_alias_target(
+            &document.buffer,
+            identifier_range.end as usize,
+            &mut owner,
+            &mut name,
+        );
+        (
+            target,
+            module_target,
+            qualified_path,
+            on_module_definition,
+            follow_type_alias,
         )
     };
-    if local_target.is_some_and(|(_, _, kind)| kind == crate::code_index::CodeSymbolKind::Module)
-        && editor_goto_module_file(editor, &name)
+    if let Some((start, end)) = module_target
+        && (qualified_path
+            || local_target.is_some_and(|(_, _, kind)| kind == CodeSymbolKind::Module))
     {
-        return;
-    }
-    if let Some((start, end, _)) = local_target {
+        if on_module_definition && editor_goto_module_file(editor, &name) {
+            return;
+        }
         editor_select_symbol(editor, start, end);
         return;
+    }
+    if let Some((start, end, kind)) = local_target
+        && !follow_type_alias
+        && (owner.is_empty() || kind == CodeSymbolKind::Module)
+        && (!qualified_path || kind != crate::code_index::CodeSymbolKind::Value)
+    {
+        editor_select_symbol(editor, start, end);
+        return;
+    }
+    if editor_goto_external_definition(editor, &owner, &glob_owners, &name) {
+        return;
+    }
+    if rust_method_index_finish(&mut editor.rust_methods) {
+        editor_refresh_completion(editor);
+        if editor_goto_external_definition(editor, &owner, &glob_owners, &name) {
+            return;
+        }
+    }
+    while editor.project_discovery.is_some() {
+        editor_poll_project_discovery(editor);
+    }
+    if rust_method_index_finish(&mut editor.rust_methods) {
+        editor_refresh_completion(editor);
+        if editor_goto_external_definition(editor, &owner, &glob_owners, &name) {
+            return;
+        }
+    }
+    editor_finish_project_search(editor);
+    if editor_goto_external_definition(editor, &owner, &glob_owners, &name) {
+        return;
+    }
+    editor.status.push_str("definition not found");
+}
+
+fn editor_fill_struct_fields(editor: &mut Editor) {
+    profiling::function_scope!();
+    if !editor_document(editor).code_index.enabled {
+        editor.status.push_str("no Rust code action at selection");
+        return;
+    }
+    let temp = idno_std::mem().scratch().temp();
+    let mut brace_stack = temp.vec(32);
+    let Some((open, close)) = rust_enclosing_braces(
+        &editor_document(editor).buffer,
+        editor_document(editor).cursor,
+        &mut brace_stack,
+    ) else {
+        editor.status.push_str("no struct literal at selection");
+        return;
+    };
+    let mut name_end = open;
+    while name_end > 0
+        && buffer_byte(&editor_document(editor).buffer, name_end - 1).is_ascii_whitespace()
+    {
+        name_end -= 1;
+    }
+    let mut name_start = name_end;
+    while name_start > 0
+        && rust_identifier_byte(buffer_byte(&editor_document(editor).buffer, name_start - 1))
+    {
+        name_start -= 1;
+    }
+    if name_start == name_end {
+        editor.status.push_str("no struct literal at selection");
+        return;
+    }
+    let mut owner = temp.vec(32);
+    let mut owner_end = name_start;
+    if owner_end >= 2
+        && buffer_byte(&editor_document(editor).buffer, owner_end - 1) == b':'
+        && buffer_byte(&editor_document(editor).buffer, owner_end - 2) == b':'
+    {
+        owner_end -= 2;
+        let mut owner_start = owner_end;
+        while owner_start > 0
+            && rust_identifier_byte(buffer_byte(
+                &editor_document(editor).buffer,
+                owner_start - 1,
+            ))
+        {
+            owner_start -= 1;
+        }
+        for position in owner_start..owner_end {
+            owner.push(buffer_byte(&editor_document(editor).buffer, position));
+        }
+    }
+    let mut name = temp.vec(name_end - name_start);
+    for position in name_start..name_end {
+        name.push(buffer_byte(&editor_document(editor).buffer, position));
+    }
+    if rust_method_index_finish(&mut editor.rust_methods) {
+        editor_refresh_completion(editor);
+    }
+    let Some(symbol) = rust_indexed_symbol(&editor.rust_methods.corpus, &owner, &[], &name) else {
+        editor.status.push_str("struct definition not indexed");
+        return;
+    };
+    let definition = editor.rust_methods.corpus.symbols[symbol];
+    let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+        editor.status.push_str("struct definition has no source");
+        return;
+    };
+    let source = match std::fs::read(path) {
+        Ok(source) => source,
+        Err(error) => {
+            write!(&mut editor.status, "cannot read struct definition: {error}").unwrap();
+            return;
+        }
+    };
+    let Some(declaration_open) = source[definition.end as usize..]
+        .iter()
+        .position(|&byte| byte == b'{')
+        .map(|position| definition.end as usize + position)
+    else {
+        editor.status.push_str("definition is not a field struct");
+        return;
+    };
+    let Some(declaration_close) = rust_matching_source_brace(&source, declaration_open) else {
+        editor.status.push_str("incomplete struct definition");
+        return;
+    };
+    let mut fields = temp.vec(32);
+    rust_struct_field_ranges(&source, declaration_open, declaration_close, &mut fields);
+    if fields.is_empty() {
+        editor.status.push_str("struct has no named fields");
+        return;
+    }
+    let document = editor_document(editor);
+    let interior_is_empty = (open + 1..close)
+        .all(|position| buffer_byte(&document.buffer, position).is_ascii_whitespace());
+    if !interior_is_empty {
+        editor
+            .status
+            .push_str("fill fields currently requires an empty literal");
+        return;
+    }
+    let line_start = buffer_line_start(&document.buffer, open);
+    let mut base_indentation = temp.vec(open - line_start);
+    for position in line_start..open {
+        let byte = buffer_byte(&document.buffer, position);
+        if !matches!(byte, b' ' | b'\t') {
+            base_indentation.clear();
+            break;
+        }
+        base_indentation.push(byte);
+    }
+    let indentation_spaces = editor.config.indentation_spaces.max(1);
+    let mut inserted = temp.vec(fields.len() * 32);
+    for field in &fields {
+        inserted.push(b'\n');
+        inserted.extend_from_slice(&base_indentation);
+        inserted.extend(std::iter::repeat_n(b' ', indentation_spaces));
+        inserted.extend_from_slice(&source[field.start as usize..field.end as usize]);
+        inserted.extend_from_slice(b": todo!(),");
+    }
+    inserted.push(b'\n');
+    inserted.extend_from_slice(&base_indentation);
+    let document = editor_document_mut(editor);
+    let mut replacements = temp.vec(1);
+    replacements.push(Replacement {
+        start: open + 1,
+        end: close,
+        inserted: 0..inserted.len(),
+    });
+    document_replace_ranges(document, &mut replacements, &inserted, None);
+    editor.status.push_str("filled struct fields");
+}
+
+fn rust_enclosing_braces(
+    buffer: &GapBuffer,
+    target: usize,
+    stack: &mut Vec<usize, impl Allocator>,
+) -> Option<(usize, usize)> {
+    profiling::function_scope!();
+    stack.clear();
+    let length = buffer_len(buffer);
+    let mut position = 0usize;
+    while position < length {
+        let byte = buffer_byte(buffer, position);
+        if byte == b'{' {
+            stack.push(position);
+        } else if byte == b'}' {
+            if position >= target
+                && let Some(&open) = stack.last()
+                && open <= target
+            {
+                return Some((open, position));
+            }
+            stack.pop();
+        }
+        position += 1;
+    }
+    None
+}
+
+fn rust_matching_source_brace(source: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (position, &byte) in source.iter().enumerate().skip(open) {
+        if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(position);
+            }
+        }
+    }
+    None
+}
+
+fn rust_struct_field_ranges(
+    source: &[u8],
+    open: usize,
+    close: usize,
+    fields: &mut Vec<std::ops::Range<u32>, impl Allocator>,
+) {
+    profiling::function_scope!();
+    fields.clear();
+    let mut position = open + 1;
+    let mut depth = 1usize;
+    while position < close {
+        let byte = source[position];
+        if byte == b'{' {
+            depth += 1;
+            position += 1;
+            continue;
+        }
+        if byte == b'}' {
+            depth = depth.saturating_sub(1);
+            position += 1;
+            continue;
+        }
+        if depth != 1 || !rust_identifier_byte(byte) || byte.is_ascii_digit() {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        position += 1;
+        while position < close && rust_identifier_byte(source[position]) {
+            position += 1;
+        }
+        let end = position;
+        while position < close && source[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if position < close
+            && source[position] == b':'
+            && source.get(position + 1) != Some(&b':')
+            && end <= u32::MAX as usize
+        {
+            fields.push(start as u32..end as u32);
+        }
+    }
+}
+
+fn editor_goto_external_definition(
+    editor: &mut Editor,
+    owner: &[u8],
+    glob_owners: &[u8],
+    name: &[u8],
+) -> bool {
+    profiling::function_scope!();
+    if let Some(primitive) = rust_primitive_document_symbol(name) {
+        return editor_goto_indexed_rust_symbol(editor, &[], &[], primitive);
     }
     let method = {
         let document = editor_document(editor);
@@ -4644,7 +6979,7 @@ fn editor_goto_definition(editor: &mut Editor) {
     if let Some(method) = method {
         let definition = editor.rust_methods.corpus.methods[method];
         let Some(path) = rust_method_path(&editor.rust_methods.corpus, method) else {
-            return;
+            return false;
         };
         let path = path.to_path_buf();
         editor_navigate_to_symbol(
@@ -4653,30 +6988,351 @@ fn editor_goto_definition(editor: &mut Editor) {
             definition.position as usize,
             definition.end as usize,
         );
-        return;
+        return true;
     }
-    if editor_goto_workspace_symbol(editor, &name) {
-        return;
+    if editor_goto_indexed_rust_symbol(editor, owner, glob_owners, name) {
+        return true;
     }
-    if editor_goto_indexed_rust_symbol(editor, &name) {
-        return;
+    if glob_owners.is_empty() && editor_goto_workspace_symbol(editor, owner, name) {
+        return true;
     }
-    editor.status.push_str("definition not indexed");
+    false
 }
 
-fn editor_goto_indexed_rust_symbol(editor: &mut Editor, name: &[u8]) -> bool {
+fn rust_primitive_document_symbol(name: &[u8]) -> Option<&'static [u8]> {
+    match name {
+        b"bool" => Some(b"prim_bool"),
+        b"char" => Some(b"prim_char"),
+        b"str" => Some(b"prim_str"),
+        b"i8" => Some(b"prim_i8"),
+        b"i16" => Some(b"prim_i16"),
+        b"i32" => Some(b"prim_i32"),
+        b"i64" => Some(b"prim_i64"),
+        b"i128" => Some(b"prim_i128"),
+        b"isize" => Some(b"prim_isize"),
+        b"u8" => Some(b"prim_u8"),
+        b"u16" => Some(b"prim_u16"),
+        b"u32" => Some(b"prim_u32"),
+        b"u64" => Some(b"prim_u64"),
+        b"u128" => Some(b"prim_u128"),
+        b"usize" => Some(b"prim_usize"),
+        b"f16" => Some(b"prim_f16"),
+        b"f32" => Some(b"prim_f32"),
+        b"f64" => Some(b"prim_f64"),
+        b"f128" => Some(b"prim_f128"),
+        _ => None,
+    }
+}
+
+fn rust_type_alias_target(
+    buffer: &GapBuffer,
+    alias_end: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+    name: &mut Vec<u8, impl Allocator>,
+) -> bool {
     profiling::function_scope!();
-    let symbol = editor
-        .rust_methods
-        .corpus
-        .symbols
-        .iter()
-        .enumerate()
-        .find_map(|(index, symbol)| {
-            let candidate = &editor.rust_methods.corpus.bytes
-                [symbol.name_start as usize..symbol.name_end as usize];
-            (candidate == name).then_some(index)
+    let length = buffer_len(buffer);
+    let mut position = alias_end;
+    let mut angle_depth = 0usize;
+    loop {
+        if position >= length {
+            return false;
+        }
+        let byte = buffer_byte(buffer, position);
+        if matches!(byte, b'\n' | b';' | b'{') {
+            return false;
+        }
+        if byte == b'<' {
+            angle_depth += 1;
+        } else if byte == b'>' {
+            angle_depth = angle_depth.saturating_sub(1);
+        } else if byte == b'=' && angle_depth == 0 {
+            position += 1;
+            break;
+        }
+        position += 1;
+    }
+
+    owner.clear();
+    name.clear();
+    loop {
+        while position < length && !rust_identifier_byte(buffer_byte(buffer, position)) {
+            if matches!(buffer_byte(buffer, position), b'\n' | b';') {
+                return false;
+            }
+            position += 1;
+        }
+        let start = position;
+        while position < length && rust_identifier_byte(buffer_byte(buffer, position)) {
+            position += 1;
+        }
+        if start == position {
+            return false;
+        }
+        let ignored = [b"dyn".as_slice(), b"impl", b"mut", b"for"]
+            .iter()
+            .any(|word| {
+                word.len() == position - start
+                    && word
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, &byte)| buffer_byte(buffer, start + offset) == byte)
+            });
+        if !ignored {
+            for byte_position in start..position {
+                name.push(buffer_byte(buffer, byte_position));
+            }
+            break;
+        }
+    }
+
+    loop {
+        let mut separator = position;
+        while separator < length && buffer_byte(buffer, separator).is_ascii_whitespace() {
+            separator += 1;
+        }
+        if separator + 1 >= length
+            || buffer_byte(buffer, separator) != b':'
+            || buffer_byte(buffer, separator + 1) != b':'
+        {
+            return !name.is_empty();
+        }
+        position = separator + 2;
+        while position < length && buffer_byte(buffer, position).is_ascii_whitespace() {
+            position += 1;
+        }
+        let start = position;
+        while position < length && rust_identifier_byte(buffer_byte(buffer, position)) {
+            position += 1;
+        }
+        if start == position {
+            return !name.is_empty();
+        }
+        owner.clear();
+        owner.extend_from_slice(name);
+        name.clear();
+        for byte_position in start..position {
+            name.push(buffer_byte(buffer, byte_position));
+        }
+    }
+}
+
+fn rust_path_separator_after(buffer: &GapBuffer, mut position: usize) -> bool {
+    let length = buffer_len(buffer);
+    while position < length && buffer_byte(buffer, position).is_ascii_whitespace() {
+        position += 1;
+    }
+    position + 1 < length
+        && buffer_byte(buffer, position) == b':'
+        && buffer_byte(buffer, position + 1) == b':'
+}
+
+fn rust_qualified_owner(
+    buffer: &GapBuffer,
+    identifier_start: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+) {
+    owner.clear();
+    let mut end = identifier_start;
+    while end > 0 && buffer_byte(buffer, end - 1).is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end < 2 || buffer_byte(buffer, end - 1) != b':' || buffer_byte(buffer, end - 2) != b':' {
+        return;
+    }
+    end -= 2;
+    while end > 0 && buffer_byte(buffer, end - 1).is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && rust_identifier_byte(buffer_byte(buffer, start - 1)) {
+        start -= 1;
+    }
+    for position in start..end {
+        owner.push(buffer_byte(buffer, position));
+    }
+}
+
+fn rust_import_owner(
+    buffer: &GapBuffer,
+    index: &CodeIndex,
+    identifier: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+) {
+    profiling::function_scope!();
+    owner.clear();
+    let Some(target) = index.identifiers.get(identifier).copied() else {
+        return;
+    };
+    if rust_import_owner_at(buffer, target.start as usize, owner) {
+        return;
+    }
+    for candidate in &index.identifiers {
+        if candidate.start == target.start
+            || candidate.end - candidate.start != target.end - target.start
+        {
+            continue;
+        }
+        let equal = (0..target.end as usize - target.start as usize).all(|offset| {
+            buffer_byte(buffer, candidate.start as usize + offset)
+                == buffer_byte(buffer, target.start as usize + offset)
         });
+        if equal && rust_import_owner_at(buffer, candidate.start as usize, owner) {
+            return;
+        }
+    }
+}
+
+fn rust_import_owner_at(
+    buffer: &GapBuffer,
+    identifier_start: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let mut statement_start = identifier_start;
+    while statement_start > 0 && buffer_byte(buffer, statement_start - 1) != b';' {
+        statement_start -= 1;
+    }
+    let mut use_position = statement_start;
+    while use_position < identifier_start && buffer_byte(buffer, use_position).is_ascii_whitespace()
+    {
+        use_position += 1;
+    }
+    if !buffer_range_matches_identifier(buffer, use_position, identifier_start, b"use") {
+        return false;
+    }
+
+    let mut position = identifier_start;
+    while position > statement_start && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    if position >= statement_start + 2
+        && buffer_byte(buffer, position - 1) == b':'
+        && buffer_byte(buffer, position - 2) == b':'
+    {
+        position -= 2;
+    } else {
+        let mut brace_depth = 0usize;
+        loop {
+            if position <= statement_start {
+                return false;
+            }
+            position -= 1;
+            match buffer_byte(buffer, position) {
+                b'}' => brace_depth += 1,
+                b'{' if brace_depth > 0 => brace_depth -= 1,
+                b'{' => break,
+                _ => {}
+            }
+        }
+        while position > statement_start && buffer_byte(buffer, position - 1).is_ascii_whitespace()
+        {
+            position -= 1;
+        }
+        if position < statement_start + 2
+            || buffer_byte(buffer, position - 1) != b':'
+            || buffer_byte(buffer, position - 2) != b':'
+        {
+            return false;
+        }
+        position -= 2;
+    }
+    while position > statement_start && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    let end = position;
+    while position > statement_start && rust_identifier_byte(buffer_byte(buffer, position - 1)) {
+        position -= 1;
+    }
+    if position == end {
+        return false;
+    }
+    owner.clear();
+    for byte_position in position..end {
+        owner.push(buffer_byte(buffer, byte_position));
+    }
+    true
+}
+
+fn rust_glob_import_owners(
+    buffer: &GapBuffer,
+    before: usize,
+    owners: &mut Vec<u8, impl Allocator>,
+) {
+    profiling::function_scope!();
+    owners.clear();
+    let mut line_start = 0usize;
+    while line_start < before {
+        let line_end = buffer_line_end(buffer, line_start).min(before);
+        let mut position = line_start;
+        while position < line_end && buffer_byte(buffer, position).is_ascii_whitespace() {
+            position += 1;
+        }
+        if position + 3 > line_end
+            || !buffer_range_matches_identifier(buffer, position, line_end, b"use")
+        {
+            line_start = line_end.saturating_add(1);
+            continue;
+        }
+        position += 3;
+        let mut last_start = position;
+        let mut last_end = position;
+        let mut glob = false;
+        while position < line_end {
+            while position < line_end && buffer_byte(buffer, position).is_ascii_whitespace() {
+                position += 1;
+            }
+            if position >= line_end {
+                break;
+            }
+            if buffer_byte(buffer, position) == b'*' {
+                glob = true;
+                break;
+            }
+            let start = position;
+            while position < line_end && rust_identifier_byte(buffer_byte(buffer, position)) {
+                position += 1;
+            }
+            if start == position {
+                break;
+            }
+            last_start = start;
+            last_end = position;
+            while position < line_end && buffer_byte(buffer, position).is_ascii_whitespace() {
+                position += 1;
+            }
+            if position + 1 >= line_end
+                || buffer_byte(buffer, position) != b':'
+                || buffer_byte(buffer, position + 1) != b':'
+            {
+                break;
+            }
+            position += 2;
+        }
+        if glob && last_end > last_start {
+            for byte_position in last_start..last_end {
+                owners.push(buffer_byte(buffer, byte_position));
+            }
+            owners.push(0);
+        }
+        line_start = line_end.saturating_add(1);
+    }
+}
+
+fn rust_owner_imported_by_glob(owners: &[u8], owner: &[u8]) -> bool {
+    owners
+        .split(|&byte| byte == 0)
+        .any(|candidate| candidate == owner)
+}
+
+fn editor_goto_indexed_rust_symbol(
+    editor: &mut Editor,
+    owner: &[u8],
+    glob_owners: &[u8],
+    name: &[u8],
+) -> bool {
+    profiling::function_scope!();
+    let symbol = rust_indexed_symbol(&editor.rust_methods.corpus, owner, glob_owners, name);
     let Some(symbol) = symbol else {
         return false;
     };
@@ -4692,6 +7348,111 @@ fn editor_goto_indexed_rust_symbol(editor: &mut Editor, name: &[u8]) -> bool {
         definition.end as usize,
     );
     true
+}
+
+fn rust_indexed_symbol(
+    corpus: &RustMethodCorpus,
+    owner: &[u8],
+    glob_owners: &[u8],
+    name: &[u8],
+) -> Option<usize> {
+    profiling::function_scope!();
+    let namespace_root = if owner.is_empty() {
+        None
+    } else {
+        rust_namespace_root(corpus, owner)
+    };
+    corpus
+        .symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            let candidate = &corpus.bytes[symbol.name_start as usize..symbol.name_end as usize];
+            if candidate != name {
+                return None;
+            }
+            let candidate_owner = rust_symbol_owner(corpus, index).as_bytes();
+            let path = rust_symbol_path(corpus, index);
+            let rank = if owner.is_empty()
+                && glob_owners.is_empty()
+                && rust_prelude_module(name).is_some_and(|module| {
+                    path.is_some_and(|path| {
+                        rust_standard_library_path(path) && rust_path_module_matches(path, module)
+                    })
+                }) {
+                6
+            } else if !owner.is_empty() && candidate_owner == owner {
+                4
+            } else if !candidate_owner.is_empty()
+                && rust_owner_imported_by_glob(glob_owners, candidate_owner)
+            {
+                3
+            } else if !owner.is_empty()
+                && path.is_some_and(|path| rust_path_module_matches(path, owner))
+            {
+                2
+            } else if !owner.is_empty()
+                && candidate_owner.is_empty()
+                && path
+                    .is_some_and(|path| namespace_root.is_some_and(|root| path.starts_with(root)))
+            {
+                2
+            } else if owner.is_empty() && glob_owners.is_empty() && candidate_owner.is_empty() {
+                1
+            } else {
+                0
+            };
+            (rank > 0).then_some((rank, index))
+        })
+        .max_by_key(|&(rank, _)| rank)
+        .map(|(_, index)| index)
+}
+
+fn rust_prelude_module(name: &[u8]) -> Option<&'static [u8]> {
+    match name {
+        b"Box" => Some(b"boxed"),
+        b"Clone" => Some(b"clone"),
+        b"Copy" => Some(b"marker"),
+        b"Default" => Some(b"default"),
+        b"Into" | b"From" | b"TryFrom" | b"TryInto" => Some(b"convert"),
+        b"Iterator" | b"IntoIterator" => Some(b"iter"),
+        b"Option" => Some(b"option"),
+        b"Result" => Some(b"result"),
+        b"String" => Some(b"string"),
+        b"ToOwned" => Some(b"borrow"),
+        b"Vec" => Some(b"vec"),
+        _ => None,
+    }
+}
+
+fn rust_standard_library_path(path: &std::path::Path) -> bool {
+    profiling::function_scope!();
+    let mut after_library = false;
+    for component in path.components() {
+        let bytes = component.as_os_str().as_encoded_bytes();
+        if after_library && matches!(bytes, b"core" | b"alloc" | b"std") {
+            return true;
+        }
+        after_library = bytes == b"library";
+    }
+    false
+}
+
+fn rust_path_module_matches(path: &std::path::Path, owner: &[u8]) -> bool {
+    let direct = path
+        .file_stem()
+        .map(std::ffi::OsStr::as_encoded_bytes)
+        .is_some_and(|name| name == owner);
+    direct
+        || (path.file_stem() == Some(std::ffi::OsStr::new("mod"))
+            && path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .map(std::ffi::OsStr::as_encoded_bytes)
+                .is_some_and(|name| name == owner))
+        || path
+            .components()
+            .any(|component| component.as_os_str().as_encoded_bytes() == owner)
 }
 
 fn editor_goto_module_file(editor: &mut Editor, name: &[u8]) -> bool {
@@ -4715,54 +7476,106 @@ fn editor_goto_module_file(editor: &mut Editor, name: &[u8]) -> bool {
     } else {
         return false;
     };
-    editor_navigate_to_symbol(editor, &path, 0, 0);
+    editor_navigate_to_module(editor, &path);
     true
 }
 
-fn editor_goto_workspace_symbol(editor: &mut Editor, name: &[u8]) -> bool {
+fn editor_goto_workspace_symbol(editor: &mut Editor, owner: &[u8], name: &[u8]) -> bool {
     profiling::function_scope!();
-    let target = editor.project_search.as_ref().and_then(|corpus| {
-        corpus.lines.iter().find_map(|line| {
-            let project_file = line.project_file as usize;
-            if project_file >= editor.project.labels.len()
-                || !editor.project.labels[project_file].ends_with(".rs")
-            {
-                return None;
-            }
-            let source = &corpus.bytes[line.text_start as usize..line.display_end as usize];
-            let Some((start, end)) = rust_symbol_name_range(source) else {
-                return None;
-            };
-            (source[start..end] == *name).then_some((
-                project_file,
-                line.file_offset as usize + start,
-                line.file_offset as usize + end,
-            ))
-        })
+    let preferred_project_file = editor_document(editor).path.as_ref().and_then(|path| {
+        editor
+            .project
+            .paths
+            .iter()
+            .position(|candidate| candidate == path)
     });
-    let Some((project_file, start, end)) = target else {
+    let Some(corpus) = editor.project_search.as_ref() else {
         return false;
     };
+    let Some(symbol) = search_corpus_symbol(
+        corpus,
+        &editor.project.paths,
+        owner,
+        name,
+        preferred_project_file,
+    ) else {
+        return false;
+    };
+    let symbol = corpus.symbols[symbol];
+    let project_file = symbol.project_file as usize;
     let Some(path) = editor.project.paths.get(project_file).cloned() else {
         return false;
     };
-    editor_navigate_to_symbol(editor, &path, start, end);
+    editor_navigate_to_symbol(editor, &path, symbol.start as usize, symbol.end as usize);
     true
+}
+
+fn search_corpus_symbol(
+    corpus: &SearchCorpus,
+    project_paths: &[std::path::PathBuf],
+    owner: &[u8],
+    name: &[u8],
+    preferred_project_file: Option<usize>,
+) -> Option<usize> {
+    profiling::function_scope!();
+    let first = corpus.symbols.partition_point(|symbol| {
+        &corpus.bytes[symbol.name_start as usize..symbol.name_end as usize] < name
+    });
+    let last = corpus.symbols.partition_point(|symbol| {
+        &corpus.bytes[symbol.name_start as usize..symbol.name_end as usize] <= name
+    });
+    let candidates = &corpus.symbols[first..last];
+    candidates
+        .iter()
+        .position(|symbol| {
+            preferred_project_file == Some(symbol.project_file as usize)
+                && (owner.is_empty()
+                    || project_paths
+                        .get(symbol.project_file as usize)
+                        .is_some_and(|path| rust_path_module_matches(path, owner)))
+        })
+        .or_else(|| {
+            candidates.iter().position(|symbol| {
+                owner.is_empty()
+                    || project_paths
+                        .get(symbol.project_file as usize)
+                        .is_some_and(|path| rust_path_module_matches(path, owner))
+            })
+        })
+        .map(|position| first + position)
 }
 
 fn editor_select_references(editor: &mut Editor) {
     profiling::function_scope!();
+    if !editor_document(editor).code_index.enabled {
+        editor
+            .status
+            .push_str("reference provider unavailable for this language");
+        return;
+    }
+    editor_finish_workspace_refresh(editor);
     let temp = idno_std::mem().scratch().temp();
     let mut name = temp.vec(64);
-    let mut workspace = true;
+    let mut owner = temp.vec(64);
+    let mut glob_owners = temp.vec(64);
+    let mut definition = ReferenceDefinition {
+        identifier: None,
+        position: None,
+        rust_symbol: None,
+        workspace_symbol: None,
+        workspace: true,
+    };
+    let mut field_owner = temp.vec(64);
     {
         let document = editor_document_mut(editor);
-        code_index_step(
-            &document.buffer,
-            &mut document.code_index,
-            256 * 1024,
-            std::time::Duration::from_micros(500),
-        );
+        while !document.code_index.complete {
+            code_index_step(
+                &document.buffer,
+                &mut document.code_index,
+                256 * 1024,
+                std::time::Duration::MAX,
+            );
+        }
         let Some(identifier_index) =
             code_index_identifier_at(&document.code_index, document.cursor)
         else {
@@ -4770,98 +7583,645 @@ fn editor_select_references(editor: &mut Editor) {
             return;
         };
         let identifier = document.code_index.identifiers[identifier_index];
-        if let Some(definition) =
+        if let Some(local_definition) =
             code_index_definition_for(&document.buffer, &document.code_index, identifier_index)
         {
-            workspace = document.code_index.symbols[definition].kind
-                != crate::code_index::CodeSymbolKind::Value;
+            let symbol = document.code_index.symbols[local_definition];
+            definition.workspace = symbol.kind != crate::code_index::CodeSymbolKind::Value;
+            definition.identifier = Some(symbol.identifier);
+            let definition_identifier = document.code_index.identifiers[symbol.identifier as usize];
+            definition.position = Some(definition_identifier.start as usize);
+            if symbol.kind == CodeSymbolKind::Value {
+                rust_struct_field_owner(
+                    &document.buffer,
+                    definition_identifier.start as usize,
+                    &mut field_owner,
+                );
+                definition.workspace |= !field_owner.is_empty();
+            }
         }
+        rust_qualified_owner(&document.buffer, identifier.start as usize, &mut owner);
+        if owner.is_empty() {
+            rust_import_owner(
+                &document.buffer,
+                &document.code_index,
+                identifier_index,
+                &mut owner,
+            );
+        }
+        rust_glob_import_owners(
+            &document.buffer,
+            identifier.start as usize,
+            &mut glob_owners,
+        );
         for position in identifier.start as usize..identifier.end as usize {
             name.push(buffer_byte(&document.buffer, position));
         }
     }
+    if rust_method_index_finish(&mut editor.rust_methods) {
+        editor_refresh_completion(editor);
+    }
+    editor_finish_project_search(editor);
+    if definition.identifier.is_none() {
+        definition.rust_symbol =
+            rust_indexed_symbol(&editor.rust_methods.corpus, &owner, &glob_owners, &name);
+    }
+    if definition.workspace
+        && field_owner.is_empty()
+        && let Some(corpus) = editor.project_search.as_ref()
+    {
+        let preferred_project_file = editor_document(editor).path.as_ref().and_then(|path| {
+            editor
+                .project
+                .paths
+                .iter()
+                .position(|candidate| candidate == path)
+        });
+        definition.workspace_symbol = search_corpus_symbol(
+            corpus,
+            &editor.project.paths,
+            &owner,
+            &name,
+            preferred_project_file,
+        );
+    }
     editor_open_picker(editor, PickerKind::References);
     let mut picker = editor.picker.take().unwrap();
-    reference_targets_collect(editor, &name, workspace, &mut picker);
+    search_corpus_index_document(editor_document(editor), &mut picker.preview_corpus);
+    reference_targets_collect(editor, &name, definition, &field_owner, &mut picker);
     if picker.reference_targets.is_empty() {
         editor.status.push_str("no references indexed");
         return;
     }
     picker_refresh(editor, &mut picker);
+    picker_rebuild_preview(editor, &mut picker);
     editor.picker = Some(picker);
 }
 
-fn reference_targets_collect(editor: &Editor, name: &[u8], workspace: bool, picker: &mut Picker) {
+fn reference_targets_collect(
+    editor: &Editor,
+    name: &[u8],
+    definition: ReferenceDefinition,
+    field_owner: &[u8],
+    picker: &mut Picker,
+) {
     profiling::function_scope!();
+    let temp = idno_std::mem().scratch().temp();
+    let mut inferred_owner = temp.vec(64);
     let document = editor_document(editor);
+    let current_label = document
+        .path
+        .as_deref()
+        .map(|path| path.strip_prefix(&editor.project.root).unwrap_or(path));
     let current_project_file = document.path.as_ref().and_then(|path| {
         let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
         editor.project.paths.iter().position(|candidate| {
             std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone()) == path
         })
     });
+    let canonical_workspace_location = definition
+        .workspace_symbol
+        .and_then(|symbol| {
+            editor.project_search.as_ref().and_then(|corpus| {
+                corpus
+                    .symbols
+                    .get(symbol)
+                    .map(|symbol| (symbol.project_file as usize, symbol.start as usize))
+            })
+        })
+        .or_else(|| {
+            definition.rust_symbol.and_then(|symbol| {
+                let Some(rust_symbol) = editor.rust_methods.corpus.symbols.get(symbol) else {
+                    return None;
+                };
+                let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+                    return None;
+                };
+                editor
+                    .project
+                    .paths
+                    .iter()
+                    .position(|candidate| candidate == path)
+                    .map(|project_file| (project_file, rust_symbol.position as usize))
+            })
+        })
+        .or_else(|| current_project_file.zip(definition.position));
     let length = buffer_len(&document.buffer);
-    let mut line_start = 0;
+    let mut line_start = 0usize;
     let mut line_number = 1;
-    while line_start <= length {
-        let line_end = buffer_line_end(&document.buffer, line_start);
-        let mut position = line_start;
-        while position + name.len() <= line_end {
-            if buffer_range_matches_identifier(&document.buffer, position, line_end, name) {
-                let label_start = picker.symbol_corpus.bytes.len();
-                write!(&mut picker.symbol_corpus.bytes, "{line_number}: ").unwrap();
-                buffer_append_range(
+    let mut line_end = buffer_line_end(&document.buffer, line_start);
+    for (indexed_identifier, identifier) in document.code_index.identifiers.iter().enumerate() {
+        let position = identifier.start as usize;
+        if identifier.end as usize - position != name.len()
+            || !(0..name.len())
+                .all(|offset| buffer_byte(&document.buffer, position + offset) == name[offset])
+        {
+            continue;
+        }
+        while position > line_end && line_end < length {
+            line_start = line_end + 1;
+            line_end = buffer_line_end(&document.buffer, line_start);
+            line_number += 1;
+        }
+        let same_definition = definition.identifier.is_none_or(|expected| {
+            code_index_definition_for(&document.buffer, &document.code_index, indexed_identifier)
+                .is_some_and(|symbol| document.code_index.symbols[symbol].identifier == expected)
+        });
+        if same_definition
+            && (field_owner.is_empty()
+                || definition.position == Some(position)
+                || rust_field_reference_matches_buffer(
                     &document.buffer,
-                    line_start,
-                    line_end,
-                    &mut picker.symbol_corpus.bytes,
-                );
-                reference_target_push(
-                    picker,
-                    u32::MAX,
                     position,
-                    position + name.len(),
-                    label_start,
-                );
+                    field_owner,
+                    &mut inferred_owner,
+                ))
+        {
+            let label_start = picker.symbol_corpus.bytes.len();
+            match current_label {
+                Some(path) => {
+                    write!(
+                        &mut picker.symbol_corpus.bytes,
+                        "{}:{line_number}",
+                        path.display()
+                    )
+                    .unwrap();
+                }
+                None => write!(&mut picker.symbol_corpus.bytes, "[scratch]:{line_number}").unwrap(),
             }
-            position += 1;
+            reference_target_push(
+                picker,
+                u32::MAX,
+                position,
+                position + name.len(),
+                label_start,
+            );
         }
-        if line_end >= length {
-            break;
-        }
-        line_start = line_end + 1;
-        line_number += 1;
     }
-    if !workspace {
+    if !definition.workspace {
         return;
     }
     let Some(corpus) = editor.project_search.as_ref() else {
         return;
     };
-    for line in &corpus.lines {
-        let project_file = line.project_file as usize;
+    let first = corpus.identifiers.partition_point(|identifier| {
+        &corpus.bytes[identifier.name_start as usize..identifier.name_end as usize] < name
+    });
+    let last = corpus.identifiers.partition_point(|identifier| {
+        &corpus.bytes[identifier.name_start as usize..identifier.name_end as usize] <= name
+    });
+    for identifier in &corpus.identifiers[first..last] {
+        let project_file = identifier.project_file as usize;
         if current_project_file == Some(project_file) {
             continue;
         }
+        let Some(line) = corpus.lines.get(identifier.line as usize) else {
+            continue;
+        };
         let source = &corpus.bytes[line.text_start as usize..line.display_end as usize];
-        let mut position = 0;
-        while position + name.len() <= source.len() {
-            if slice_range_matches_identifier(source, position, name) {
-                let label_start = picker.symbol_corpus.bytes.len();
-                picker.symbol_corpus.bytes.extend_from_slice(
-                    &corpus.bytes[line.display_start as usize..line.display_end as usize],
-                );
-                reference_target_push(
-                    picker,
-                    line.project_file,
-                    line.file_offset as usize + position,
-                    line.file_offset as usize + position + name.len(),
-                    label_start,
-                );
+        let position = identifier.file_start.saturating_sub(line.file_offset) as usize;
+        let declaration = rust_symbol_name_range(source)
+            .is_some_and(|range| range.0 == position && range.1 == position + name.len());
+        if declaration
+            && canonical_workspace_location != Some((project_file, identifier.file_start as usize))
+        {
+            continue;
+        }
+        if !field_owner.is_empty()
+            && !search_corpus_field_reference_candidate(
+                corpus,
+                identifier.project_file,
+                source,
+                position,
+                field_owner,
+            )
+        {
+            continue;
+        }
+        let label_start = picker.symbol_corpus.bytes.len();
+        let label_end = (line.text_start as usize)
+            .saturating_sub(2)
+            .max(line.display_start as usize);
+        picker
+            .symbol_corpus
+            .bytes
+            .extend_from_slice(&corpus.bytes[line.display_start as usize..label_end]);
+        reference_target_push(
+            picker,
+            identifier.project_file,
+            identifier.file_start as usize,
+            identifier.file_end as usize,
+            label_start,
+        );
+    }
+}
+
+fn rust_field_reference_matches_buffer(
+    buffer: &GapBuffer,
+    field: usize,
+    owner: &[u8],
+    inferred_owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    let mut dot = field;
+    while dot > 0 && buffer_byte(buffer, dot - 1).is_ascii_whitespace() {
+        dot -= 1;
+    }
+    if dot == 0 || buffer_byte(buffer, dot - 1) != b'.' {
+        return false;
+    }
+    let mut receiver_end = dot - 1;
+    while receiver_end > 0 && buffer_byte(buffer, receiver_end - 1).is_ascii_whitespace() {
+        receiver_end -= 1;
+    }
+    let mut receiver_start = receiver_end;
+    while receiver_start > 0 && rust_identifier_byte(buffer_byte(buffer, receiver_start - 1)) {
+        receiver_start -= 1;
+    }
+    if receiver_start == receiver_end {
+        return false;
+    }
+    (rust_explicit_type(buffer, receiver_start, receiver_end, inferred_owner)
+        || rust_closure_parameter_element_type(
+            buffer,
+            receiver_start,
+            receiver_end,
+            inferred_owner,
+        ))
+        && inferred_owner == owner
+}
+
+fn rust_closure_parameter_element_type(
+    buffer: &GapBuffer,
+    receiver_start: usize,
+    receiver_end: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let mut close_pipe = receiver_start;
+    while close_pipe > 0 && buffer_byte(buffer, close_pipe - 1) != b'|' {
+        close_pipe -= 1;
+    }
+    if close_pipe == 0 {
+        return false;
+    }
+    close_pipe -= 1;
+    let mut open_pipe = close_pipe;
+    while open_pipe > 0 && buffer_byte(buffer, open_pipe - 1) != b'|' {
+        open_pipe -= 1;
+    }
+    if open_pipe == 0 {
+        return false;
+    }
+    open_pipe -= 1;
+    let parameter_present = (open_pipe + 1..close_pipe).any(|position| {
+        position + receiver_end - receiver_start <= close_pipe
+            && (0..receiver_end - receiver_start).all(|offset| {
+                buffer_byte(buffer, position + offset)
+                    == buffer_byte(buffer, receiver_start + offset)
+            })
+            && (position == open_pipe + 1
+                || !rust_identifier_byte(buffer_byte(buffer, position - 1)))
+            && (position + receiver_end - receiver_start == close_pipe
+                || !rust_identifier_byte(buffer_byte(
+                    buffer,
+                    position + receiver_end - receiver_start,
+                )))
+    });
+    if !parameter_present {
+        return false;
+    }
+
+    let mut position = open_pipe;
+    while position > 0 && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    if position == 0 || buffer_byte(buffer, position - 1) != b'(' {
+        return false;
+    }
+    position -= 1;
+    while position > 0 && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    while position > 0 && rust_identifier_byte(buffer_byte(buffer, position - 1)) {
+        position -= 1;
+    }
+    if position == 0 || buffer_byte(buffer, position - 1) != b'.' {
+        return false;
+    }
+    position -= 1;
+    while position > 0 && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    let collection_end = position;
+    while position > 0 && rust_identifier_byte(buffer_byte(buffer, position - 1)) {
+        position -= 1;
+    }
+    if position == collection_end {
+        return false;
+    }
+    rust_named_collection_element_type(buffer, position, collection_end, owner)
+}
+
+fn rust_named_collection_element_type(
+    buffer: &GapBuffer,
+    name_start: usize,
+    name_end: usize,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let length = buffer_len(buffer);
+    let name_length = name_end - name_start;
+    let mut candidate = 0usize;
+    while candidate + name_length <= length {
+        let equal = (0..name_length).all(|offset| {
+            buffer_byte(buffer, candidate + offset) == buffer_byte(buffer, name_start + offset)
+        });
+        let before = candidate == 0 || !rust_identifier_byte(buffer_byte(buffer, candidate - 1));
+        let after = candidate + name_length;
+        let after_boundary = after == length || !rust_identifier_byte(buffer_byte(buffer, after));
+        if !equal || !before || !after_boundary {
+            candidate += 1;
+            continue;
+        }
+        let mut position = after;
+        while position < length && buffer_byte(buffer, position).is_ascii_whitespace() {
+            position += 1;
+        }
+        if position >= length || buffer_byte(buffer, position) != b':' {
+            candidate = after;
+            continue;
+        }
+        position += 1;
+        let limit = (position + 256).min(length);
+        while position + 3 <= limit {
+            if buffer_range_matches_identifier(buffer, position, limit, b"Vec") {
+                position += 3;
+                while position < limit && buffer_byte(buffer, position).is_ascii_whitespace() {
+                    position += 1;
+                }
+                if position >= limit || buffer_byte(buffer, position) != b'<' {
+                    break;
+                }
+                position += 1;
+                while position < limit
+                    && matches!(buffer_byte(buffer, position), b'&' | b' ' | b'\t')
+                {
+                    position += 1;
+                }
+                owner.clear();
+                while position < limit {
+                    let start = position;
+                    while position < limit && rust_identifier_byte(buffer_byte(buffer, position)) {
+                        position += 1;
+                    }
+                    if start == position {
+                        return !owner.is_empty();
+                    }
+                    owner.clear();
+                    for byte_position in start..position {
+                        owner.push(buffer_byte(buffer, byte_position));
+                    }
+                    if position + 1 < limit
+                        && buffer_byte(buffer, position) == b':'
+                        && buffer_byte(buffer, position + 1) == b':'
+                    {
+                        position += 2;
+                        continue;
+                    }
+                    return true;
+                }
+            }
+            if matches!(buffer_byte(buffer, position), b';' | b'=' | b'\n') {
+                break;
             }
             position += 1;
         }
+        candidate = after;
     }
+    false
+}
+
+fn search_corpus_field_reference_candidate(
+    corpus: &SearchCorpus,
+    project_file: u32,
+    source: &[u8],
+    position: usize,
+    owner: &[u8],
+) -> bool {
+    let mut before = position;
+    while before > 0 && source[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before == 0 || source[before - 1] != b'.' {
+        return source[..position]
+            .windows(owner.len())
+            .any(|candidate| candidate == owner);
+    }
+    let mut receiver_end = before - 1;
+    while receiver_end > 0 && source[receiver_end - 1].is_ascii_whitespace() {
+        receiver_end -= 1;
+    }
+    let mut receiver_start = receiver_end;
+    while receiver_start > 0 && rust_identifier_byte(source[receiver_start - 1]) {
+        receiver_start -= 1;
+    }
+    if receiver_start == receiver_end {
+        return false;
+    }
+    let receiver = &source[receiver_start..receiver_end];
+    let first = corpus
+        .lines
+        .partition_point(|line| line.project_file < project_file);
+    let last = corpus
+        .lines
+        .partition_point(|line| line.project_file <= project_file);
+    for line in &corpus.lines[first..last] {
+        let candidate = &corpus.bytes[line.text_start as usize..line.display_end as usize];
+        let receiver_position = slice_identifier_position(candidate, receiver);
+        let owner_position = slice_identifier_position(candidate, owner);
+        if receiver_position.is_some_and(|position| {
+            owner_position.is_some_and(|owner_position| {
+                owner_position > position
+                    && candidate[position + receiver.len()..owner_position]
+                        .iter()
+                        .any(|byte| matches!(byte, b':' | b'='))
+            })
+        }) {
+            return true;
+        }
+        if receiver == b"self"
+            && slice_identifier_position(candidate, b"impl").is_some_and(|position| {
+                owner_position.is_some_and(|owner_position| owner_position > position)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn slice_identifier_position(source: &[u8], name: &[u8]) -> Option<usize> {
+    source
+        .windows(name.len())
+        .enumerate()
+        .find_map(|(position, candidate)| {
+            let end = position + name.len();
+            (candidate == name
+                && (position == 0 || !rust_identifier_byte(source[position - 1]))
+                && (end == source.len() || !rust_identifier_byte(source[end])))
+            .then_some(position)
+        })
+}
+
+fn rust_struct_field_owner(buffer: &GapBuffer, field: usize, owner: &mut Vec<u8, impl Allocator>) {
+    profiling::function_scope!();
+    owner.clear();
+    let mut position = field;
+    let mut depth = 0usize;
+    let body_start = loop {
+        if position == 0 {
+            return;
+        }
+        position -= 1;
+        match buffer_byte(buffer, position) {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => break position,
+            b'{' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    };
+    let search_start = body_start.saturating_sub(512);
+    let mut struct_position = None;
+    let mut candidate = search_start;
+    while candidate + 6 <= body_start {
+        if buffer_range_matches_identifier(buffer, candidate, body_start, b"struct") {
+            struct_position = Some(candidate + 6);
+        }
+        candidate += 1;
+    }
+    let Some(mut position) = struct_position else {
+        return;
+    };
+    while position < body_start && buffer_byte(buffer, position).is_ascii_whitespace() {
+        position += 1;
+    }
+    while position < body_start && rust_identifier_byte(buffer_byte(buffer, position)) {
+        owner.push(buffer_byte(buffer, position));
+        position += 1;
+    }
+}
+
+#[cfg(test)]
+fn rust_line_position_is_code(source: &[u8], target: usize) -> bool {
+    let mut position = 0;
+    let mut delimiter = 0;
+    let mut escaped = false;
+    while position < target.min(source.len()) {
+        let byte = source[position];
+        let next = source.get(position + 1).copied();
+        if delimiter != 0 {
+            if byte == b'\\' && !escaped {
+                escaped = true;
+            } else {
+                if byte == delimiter && !escaped {
+                    delimiter = 0;
+                }
+                escaped = false;
+            }
+            position += 1;
+        } else if byte == b'/' && next == Some(b'/') {
+            return false;
+        } else if byte == b'/' && next == Some(b'*') {
+            let Some(end) = source[position + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+            else {
+                return false;
+            };
+            position += end + 4;
+        } else if byte == b'"' || (byte == b'\'' && rust_line_char_literal(source, position)) {
+            delimiter = byte;
+            escaped = false;
+            position += 1;
+        } else {
+            position += 1;
+        }
+    }
+    delimiter == 0
+}
+
+fn rust_source_identifiers(
+    source: &[u8],
+    identifiers: &mut Vec<std::ops::Range<u32>, impl Allocator>,
+) {
+    profiling::function_scope!();
+    identifiers.clear();
+    if source.len() > u32::MAX as usize {
+        return;
+    }
+    let mut position = 0usize;
+    let mut block_depth = 0usize;
+    let mut delimiter = 0u8;
+    let mut escaped = false;
+    while position < source.len() {
+        let byte = source[position];
+        let next = source.get(position + 1).copied();
+        if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                position += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                position += 2;
+            } else {
+                position += 1;
+            }
+        } else if delimiter != 0 {
+            if byte == b'\\' && !escaped {
+                escaped = true;
+            } else {
+                if byte == delimiter && !escaped {
+                    delimiter = 0;
+                }
+                escaped = false;
+            }
+            position += 1;
+        } else if byte == b'/' && next == Some(b'/') {
+            position += 2;
+            while position < source.len() && source[position] != b'\n' {
+                position += 1;
+            }
+        } else if byte == b'/' && next == Some(b'*') {
+            block_depth = 1;
+            position += 2;
+        } else if byte == b'"' || (byte == b'\'' && rust_line_char_literal(source, position)) {
+            delimiter = byte;
+            escaped = false;
+            position += 1;
+        } else if rust_identifier_byte(byte) && !byte.is_ascii_digit() {
+            let start = position;
+            position += 1;
+            while position < source.len() && rust_identifier_byte(source[position]) {
+                position += 1;
+            }
+            identifiers.push(start as u32..position as u32);
+        } else {
+            position += 1;
+        }
+    }
+}
+
+fn rust_line_char_literal(source: &[u8], position: usize) -> bool {
+    let mut end = position + 1;
+    if source.get(end) == Some(&b'\\') {
+        end += 2;
+    } else {
+        end += 1;
+        while end < source.len() && source[end] & 0b1100_0000 == 0b1000_0000 {
+            end += 1;
+        }
+    }
+    source.get(end) == Some(&b'\'')
 }
 
 fn reference_target_push(
@@ -4904,13 +8264,6 @@ fn buffer_range_matches_identifier(
             .iter()
             .enumerate()
             .all(|(offset, &byte)| buffer_byte(buffer, start + offset) == byte)
-}
-
-fn slice_range_matches_identifier(source: &[u8], start: usize, name: &[u8]) -> bool {
-    let end = start + name.len();
-    (start == 0 || !rust_identifier_byte(source[start - 1]))
-        && (end == source.len() || !rust_identifier_byte(source[end]))
-        && source.get(start..end) == Some(name)
 }
 
 #[inline]
@@ -4989,6 +8342,20 @@ fn editor_navigate_to_symbol(
     };
     editor_switch_document_state(editor, target);
     editor_set_symbol_selection(editor, start, end);
+    editor_center_view(editor);
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
+}
+
+fn editor_navigate_to_module(editor: &mut Editor, path: &std::path::Path) {
+    profiling::function_scope!();
+    let before = editor_location(editor);
+    let Some(target) = editor_document_target(editor, path.to_path_buf()) else {
+        return;
+    };
+    editor_switch_document_state(editor, target);
+    let length = buffer_len(&editor_document(editor).buffer);
+    editor_set_symbol_selection(editor, 0, length);
     editor_center_view(editor);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
@@ -5085,17 +8452,23 @@ fn command_cursor_clamped(buffer: &GapBuffer, mut cursor: usize, mode: Mode) -> 
 fn editor_render(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Result<()> {
     let (width, height) = terminal::terminal_size(terminal);
     let picker = editor.picker.is_some();
-    let force = width != editor.terminal_width
+    let picker_changed = picker != editor.rendered_picker;
+    let background_changed = width != editor.terminal_width
         || height != editor.terminal_height
-        || picker != editor.rendered_picker
         || editor.theme != editor.rendered_theme;
+    let force = background_changed || picker_changed;
     editor.terminal_width = width;
     editor.terminal_height = height;
     editor.rendered_picker = picker;
     editor.rendered_theme = editor.theme;
     if picker {
-        editor.rendered_row_hashes.clear();
-        editor.rendered_overlay_start = None;
+        if picker_changed || background_changed {
+            editor.rendered_row_hashes.clear();
+            editor.rendered_overlay_start = None;
+            if let Err(error) = editor_render_document(editor, terminal, width, height, true) {
+                return Err(error);
+            }
+        }
         return editor_render_picker(editor, terminal, width, height);
     }
     editor_render_document(editor, terminal, width, height, force)
@@ -5126,6 +8499,51 @@ fn editor_render_document(
     let active_search_selection = search
         .and_then(|search| search.matches.get(search.selected))
         .copied();
+    let completion_preview = editor.completion.as_ref().and_then(|completion| {
+        if !completion.preview {
+            return None;
+        }
+        completion.matches.get(completion.selected).map(|&entry| {
+            (
+                entry,
+                &completion.bytes[entry.insertion_start as usize..entry.insertion_end as usize],
+            )
+        })
+    });
+    let temp = idno_std::mem().scratch().temp();
+    let document_path = editor.documents[current].path.as_deref();
+    let total_document_lines = buffer_line_count(&editor.documents[current].buffer);
+    let diagnostic_cursor_line = buffer_line_and_column(
+        &editor.documents[current].buffer,
+        editor.documents[current].cursor,
+    )
+    .0;
+    let mut diagnostic_severities = temp.vec(total_document_lines);
+    diagnostic_severities.extend(std::iter::repeat_n(u8::MAX, total_document_lines));
+    let cursor_diagnostic = editor
+        .diagnostics
+        .published
+        .iter()
+        .enumerate()
+        .filter(|(_, diagnostic)| Some(diagnostic.path.as_path()) == document_path)
+        .filter(|(_, diagnostic)| {
+            diagnostic.line as usize <= diagnostic_cursor_line
+                && diagnostic_cursor_line <= diagnostic.end_line as usize
+        })
+        .min_by_key(|(_, diagnostic)| diagnostic.severity)
+        .map(|(index, _)| index);
+    for diagnostic in editor
+        .diagnostics
+        .published
+        .iter()
+        .filter(|diagnostic| Some(diagnostic.path.as_path()) == document_path)
+    {
+        let first = (diagnostic.line as usize).min(diagnostic_severities.len());
+        let end = (diagnostic.end_line as usize + 1).min(diagnostic_severities.len());
+        for severity in &mut diagnostic_severities[first..end] {
+            *severity = (*severity).min(diagnostic.severity as u8);
+        }
+    }
     let document = &mut editor.documents[current];
     let primary_position = if let Some(selection) = active_search_selection {
         selection.cursor
@@ -5138,7 +8556,23 @@ fn editor_render_document(
     } else {
         document.cursor
     };
-    let (cursor_line, cursor_column) = buffer_line_and_column(&document.buffer, primary_position);
+    let tab_width = editor.config.indentation_spaces.max(1);
+    let cursor_line = buffer_line_and_column(&document.buffer, primary_position).0;
+    let cursor_column = buffer_terminal_column(&document.buffer, primary_position, tab_width);
+    let preview_cursor_column = completion_preview.map_or(cursor_column, |(entry, insertion)| {
+        let insertion_cursor = if entry.selection_end > entry.selection_start {
+            entry.selection_start as usize
+        } else {
+            insertion.len()
+        }
+        .min(insertion.len());
+        let base = buffer_terminal_column(&document.buffer, entry.replacement_start, tab_width);
+        let preview_width = std::str::from_utf8(&insertion[..insertion_cursor])
+            .map_or(insertion_cursor, |text| {
+                terminal_text_width(text, usize::MAX)
+            });
+        base + preview_width
+    });
     if cursor_line < document.top_line + scroll_margin {
         document.top_line = cursor_line.saturating_sub(scroll_margin);
     } else if cursor_line + scroll_margin >= document.top_line + content_height {
@@ -5147,9 +8581,8 @@ fn editor_render_document(
     let top_line = document.top_line;
     let total_lines = buffer_line_count(&document.buffer);
     let number_width = (total_lines.max(1).ilog10() as usize + 1).max(5);
-    let gutter_width = (number_width + 1).min(width);
+    let gutter_width = (number_width + 2).min(width);
     let text_width = width.saturating_sub(gutter_width);
-    let temp = idno_std::mem().scratch().temp();
     let mut selections = temp.vec(document.secondary_selections.len() + 1);
     let mut row_ranges = temp.vec(content_height);
     document_selections(document, &mut selections);
@@ -5162,7 +8595,7 @@ fn editor_render_document(
     editor.frame.clear();
     editor
         .frame
-        .extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[H");
+        .extend_from_slice(b"\x1b[?2026h\x1b[?7l\x1b[?25l\x1b[H");
     editor.frame.extend_from_slice(theme.cursor_color);
     editor.frame.extend_from_slice(theme.normal);
     let mut position = buffer_position_at_line_column(&document.buffer, top_line, 0);
@@ -5182,6 +8615,21 @@ fn editor_render_document(
         let row_start = editor.frame.len();
         let line = top_line + row;
         editor.frame.extend_from_slice(theme.gutter);
+        let diagnostic_severity = diagnostic_severities.get(line).copied().unwrap_or(u8::MAX);
+        if diagnostic_severity != u8::MAX {
+            let severity = match diagnostic_severity {
+                value if value == DiagnosticSeverity::Error as u8 => DiagnosticSeverity::Error,
+                value if value == DiagnosticSeverity::Warning as u8 => DiagnosticSeverity::Warning,
+                _ => DiagnosticSeverity::Info,
+            };
+            editor
+                .frame
+                .extend_from_slice(diagnostic_severity_style(severity, theme));
+            editor.frame.extend_from_slice("●".as_bytes());
+            editor.frame.extend_from_slice(theme.gutter);
+        } else {
+            editor.frame.push(b' ');
+        }
         if line < total_lines && !(trailing_empty_line && line + 1 == total_lines) {
             write!(&mut editor.frame, "{:>number_width$}", line + 1).unwrap();
         } else {
@@ -5190,7 +8638,7 @@ fn editor_render_document(
         let git_flags = git_gutter_flags(&document.git_gutter, line);
         if git_gutter_line_removed(git_flags) {
             editor.frame.extend_from_slice(theme.git_removed);
-            editor.frame.extend_from_slice("╴".as_bytes());
+            editor.frame.extend_from_slice("▔".as_bytes());
         } else if git_gutter_line_modified(git_flags) {
             editor.frame.extend_from_slice(theme.git_modified);
             editor.frame.extend_from_slice("▎".as_bytes());
@@ -5206,6 +8654,24 @@ fn editor_render_document(
             && buffer_byte(&document.buffer, position) != b'\n'
             && column < text_width
         {
+            if let Some((entry, insertion)) = completion_preview
+                && position == entry.replacement_start
+                && primary_position >= position
+                && buffer_line_start(&document.buffer, primary_position)
+                    == buffer_line_start(&document.buffer, position)
+            {
+                column += append_rust_completion_text(
+                    insertion,
+                    text_width - column,
+                    Some(entry.selection_start as usize..entry.selection_end as usize),
+                    theme,
+                    false,
+                    &mut editor.frame,
+                );
+                position = primary_position;
+                rendered_style = u8::MAX - 1;
+                continue;
+            }
             while syntax_span_position < syntax_spans.len()
                 && syntax_spans[syntax_span_position].end as usize <= position
             {
@@ -5222,18 +8688,7 @@ fn editor_render_document(
                     .iter()
                     .any(|selection| selection.cursor == position);
             let position_selected = search.is_none()
-                && selections.iter().any(|selection| {
-                    (mode != Mode::Insert || selection.anchor != selection.cursor)
-                        && position_is_selected(
-                            &document.buffer,
-                            std::slice::from_ref(selection),
-                            position,
-                        )
-                });
-            let position_search_scope = search.is_some_and(|search| {
-                search.kind == SearchKind::Selection
-                    && position_is_selected(&document.buffer, &search.original_selections, position)
-            });
+                && position_is_visibly_selected(&document.buffer, &selections, position, mode);
             let search_cursor = search.is_some_and(|search| {
                 if search.kind == SearchKind::Selection {
                     search
@@ -5245,47 +8700,91 @@ fn editor_render_document(
                 }
             });
             let position_search_match = search.is_some_and(|search| {
-                position_is_selected(&document.buffer, &search.matches, position)
+                if search.kind == SearchKind::Selection {
+                    position_is_selected(&document.buffer, &search.matches, position)
+                } else {
+                    active_search_selection.is_some_and(|selection| {
+                        position_is_selected(
+                            &document.buffer,
+                            std::slice::from_ref(&selection),
+                            position,
+                        )
+                    })
+                }
             });
+            let selected = position_selected || position_search_match;
             let wanted_style = if secondary_insert_cursor || normal_cursor || search_cursor {
-                3
-            } else if position_selected || position_search_match {
-                2
-            } else if position_search_scope {
-                1
+                u8::MAX
             } else {
-                syntax_style.unwrap_or(0)
+                syntax_style.unwrap_or(0) | if selected { 1 << 7 } else { 0 }
             };
             if wanted_style != rendered_style {
-                let style = match wanted_style {
-                    3 => theme.cursor,
-                    2 => theme.selection,
-                    1 => theme.search_scope,
-                    4.. => theme.syntax[(wanted_style - 4) as usize],
-                    _ => theme.normal,
-                };
-                editor.frame.extend_from_slice(style);
+                if wanted_style == u8::MAX {
+                    editor.frame.extend_from_slice(theme.cursor);
+                } else {
+                    let syntax_style = wanted_style & !(1 << 7);
+                    editor.frame.extend_from_slice(if syntax_style >= 4 {
+                        theme.syntax[(syntax_style - 4) as usize]
+                    } else {
+                        theme.normal
+                    });
+                    if wanted_style & (1 << 7) != 0 {
+                        editor.frame.extend_from_slice(theme.selection_background);
+                    }
+                }
                 rendered_style = wanted_style;
             }
             let byte = buffer_byte(&document.buffer, position);
             match byte {
                 b'\t' => {
-                    let spaces = (4 - column % 4).min(text_width - column);
+                    let spaces = (tab_width - column % tab_width).min(text_width - column);
                     editor.frame.extend(std::iter::repeat_n(b' ', spaces));
                     column += spaces;
+                    position += 1;
                 }
                 0x00..=0x1f | 0x7f => {
                     editor.frame.push(b'?');
                     column += 1;
+                    position += 1;
+                }
+                0x20..=0x7e => {
+                    editor.frame.push(byte);
+                    column += 1;
+                    position += 1;
                 }
                 _ => {
-                    editor.frame.push(byte);
-                    if byte & 0b1100_0000 != 0b1000_0000 {
-                        column += 1;
+                    let (next, character_width) = append_buffer_character_within_terminal_width(
+                        &document.buffer,
+                        position,
+                        column,
+                        text_width,
+                        &mut editor.frame,
+                    );
+                    if column + character_width > text_width {
+                        position = next;
+                        break;
                     }
+                    column += character_width;
+                    position = next;
                 }
             }
-            position += 1;
+        }
+        if let Some((entry, insertion)) = completion_preview
+            && position == entry.replacement_start
+            && primary_position >= position
+            && buffer_line_start(&document.buffer, primary_position)
+                == buffer_line_start(&document.buffer, position)
+            && column < text_width
+        {
+            column += append_rust_completion_text(
+                insertion,
+                text_width - column,
+                Some(entry.selection_start as usize..entry.selection_end as usize),
+                theme,
+                false,
+                &mut editor.frame,
+            );
+            position = primary_position;
         }
         while position < length && buffer_byte(&document.buffer, position) != b'\n' {
             position += 1;
@@ -5297,12 +8796,8 @@ fn editor_render_document(
                 && selections
                     .iter()
                     .any(|selection| selection.cursor == position);
-            let position_selected =
-                search.is_none() && position_is_selected(&document.buffer, &selections, position);
-            let position_search_scope = search.is_some_and(|search| {
-                search.kind == SearchKind::Selection
-                    && position_is_selected(&document.buffer, &search.original_selections, position)
-            });
+            let position_selected = search.is_none()
+                && position_is_visibly_selected(&document.buffer, &selections, position, mode);
             let search_cursor = search.is_some_and(|search| {
                 if search.kind == SearchKind::Selection {
                     search
@@ -5314,15 +8809,24 @@ fn editor_render_document(
                 }
             });
             let position_search_match = search.is_some_and(|search| {
-                position_is_selected(&document.buffer, &search.matches, position)
+                if search.kind == SearchKind::Selection {
+                    position_is_selected(&document.buffer, &search.matches, position)
+                } else {
+                    active_search_selection.is_some_and(|selection| {
+                        position_is_selected(
+                            &document.buffer,
+                            std::slice::from_ref(&selection),
+                            position,
+                        )
+                    })
+                }
             });
             if column < text_width {
                 let style = if secondary_insert_cursor || normal_cursor || search_cursor {
                     theme.cursor
                 } else if position_selected || position_search_match {
-                    theme.selection
-                } else if position_search_scope {
-                    theme.search_scope
+                    editor.frame.extend_from_slice(theme.normal);
+                    theme.selection_background
                 } else {
                     theme.normal
                 };
@@ -5345,6 +8849,23 @@ fn editor_render_document(
         }
         editor.frame.extend_from_slice(theme.normal);
         editor.frame.extend_from_slice(b"\x1b[K");
+        if row == 0
+            && let Some(diagnostic) =
+                cursor_diagnostic.and_then(|index| editor.diagnostics.published.get(index))
+            && width >= 24
+        {
+            let message = &diagnostic.display[diagnostic.message_start as usize..];
+            let maximum = (width / 2).max(20);
+            let message_width = terminal_text_width(message, maximum).min(maximum);
+            let column = width.saturating_sub(message_width + 2) + 1;
+            write!(&mut editor.frame, "\x1b[1;{column}H").unwrap();
+            editor
+                .frame
+                .extend_from_slice(diagnostic_severity_style(diagnostic.severity, theme));
+            editor.frame.push(b' ');
+            append_terminal_text(message, maximum, &mut editor.frame);
+            editor.frame.push(b' ');
+        }
         row_ranges.push(row_start..editor.frame.len());
         rendered_style = 0;
         if row + 1 < content_height {
@@ -5429,24 +8950,51 @@ fn editor_render_document(
         }
         editor.frame.extend_from_slice(theme.normal);
     }
+    let mut completion_overlay_start = None;
     if key_hints.is_empty()
         && let Some(completion) = editor.completion.as_ref()
         && width > 0
         && content_height > 0
     {
-        let visible = completion.matches.len().min(8).min(content_height);
+        let visible = completion
+            .matches
+            .len()
+            .min((content_height / 3).clamp(4, 16))
+            .min(content_height);
         let first = completion
             .selected
             .saturating_sub(visible.saturating_sub(1));
-        let popup_width = completion.matches[first..first + visible]
+        let name_width = completion.matches[first..first + visible]
             .iter()
-            .map(|found| rust_method_name(&editor.rust_methods.corpus, found.item).len() + 2)
+            .map(|&entry| completion_name(completion, entry).len() + 2)
             .max()
             .unwrap_or(0)
-            .min(width);
-        let popup_column = width.saturating_sub(popup_width) + 1;
-        let popup_row = content_height.saturating_sub(visible) + 1;
-        for (row, found) in completion.matches[first..first + visible]
+            .clamp(12.min(width), (width / 3).max(12).min(width));
+        let detail = completion_detail(completion, completion.matches[completion.selected]);
+        let detail_width = if width >= 50 && !detail.is_empty() {
+            width.saturating_sub(name_width + 1).min(width / 2)
+        } else {
+            0
+        };
+        let popup_width = name_width + usize::from(detail_width > 0) + detail_width;
+        let scrollbar = completion.matches.len() > visible && name_width >= 3;
+        let scrollbar_row = if scrollbar {
+            first.saturating_mul(visible.saturating_sub(1))
+                / completion.matches.len().saturating_sub(visible).max(1)
+        } else {
+            0
+        };
+        let cursor_screen_row = cursor_line.saturating_sub(top_line) + 1;
+        let cursor_screen_column = (gutter_width + cursor_column).min(width.saturating_sub(1)) + 1;
+        let popup_column = cursor_screen_column.min(width.saturating_sub(popup_width) + 1);
+        let rows_below = content_height.saturating_sub(cursor_screen_row);
+        let popup_row = if rows_below >= visible {
+            cursor_screen_row + 1
+        } else {
+            cursor_screen_row.saturating_sub(visible).max(1)
+        };
+        completion_overlay_start = Some(popup_row.saturating_sub(1));
+        for (row, &entry) in completion.matches[first..first + visible]
             .iter()
             .enumerate()
         {
@@ -5464,19 +9012,52 @@ fn editor_render_document(
                 } else {
                     theme.status
                 });
-            let name = rust_method_name(&editor.rust_methods.corpus, found.item);
-            write!(
+            let name = completion_name(completion, entry);
+            editor.frame.push(b' ');
+            let name_available = name_width.saturating_sub(2 + usize::from(scrollbar));
+            append_terminal_text(name, name_available, &mut editor.frame);
+            let rendered_name = terminal_text_width(name, name_available);
+            append_spaces(
+                name_width.saturating_sub(1 + rendered_name + usize::from(scrollbar)),
                 &mut editor.frame,
-                " {:<name_width$} ",
-                name,
-                name_width = popup_width.saturating_sub(2)
-            )
-            .unwrap();
+            );
+            if scrollbar {
+                editor
+                    .frame
+                    .extend_from_slice(if row == scrollbar_row { "█" } else { "│" }.as_bytes());
+            }
+        }
+        if detail_width > 0 {
+            for row in 0..visible {
+                write!(
+                    &mut editor.frame,
+                    "\x1b[{};{}H",
+                    popup_row + row,
+                    popup_column + name_width + 1
+                )
+                .unwrap();
+                editor.frame.extend_from_slice(theme.normal);
+                editor.frame.extend_from_slice(b"\x1b[48;2;0;0;0m");
+                let detail_line = text_line_at(detail, row);
+                editor.frame.push(b' ');
+                let detail_rendered = append_rust_completion_text(
+                    detail_line.as_bytes(),
+                    detail_width - 1,
+                    None,
+                    theme,
+                    true,
+                    &mut editor.frame,
+                );
+                append_spaces(
+                    detail_width.saturating_sub(1 + detail_rendered),
+                    &mut editor.frame,
+                );
+            }
         }
         editor.frame.extend_from_slice(theme.normal);
     }
     let screen_row = cursor_line.saturating_sub(top_line) + 1;
-    let screen_column = (gutter_width + cursor_column).min(width.saturating_sub(1)) + 1;
+    let screen_column = (gutter_width + preview_cursor_column).min(width.saturating_sub(1)) + 1;
     if let Some(search) = search {
         let prompt_column = 2 + search.query.chars().count();
         write!(
@@ -5497,11 +9078,9 @@ fn editor_render_document(
     let overlay_start = if !key_hints.is_empty() {
         Some(content_height.saturating_sub(key_hints.len().min(content_height)))
     } else {
-        editor.completion.as_ref().map(|completion| {
-            content_height.saturating_sub(completion.matches.len().min(8).min(content_height))
-        })
+        completion_overlay_start
     };
-    editor.frame.extend_from_slice(b"\x1b[?2026l");
+    editor.frame.extend_from_slice(b"\x1b[?7h\x1b[?2026l");
     editor_present_document_rows(
         editor,
         terminal,
@@ -5510,6 +9089,22 @@ fn editor_render_document(
         overlay_start,
         force,
     )
+}
+
+fn text_line_at(text: &str, wanted: usize) -> &str {
+    let mut start = 0;
+    let mut line = 0;
+    for (position, character) in text.char_indices() {
+        if character != '\n' {
+            continue;
+        }
+        if line == wanted {
+            return &text[start..position];
+        }
+        line += 1;
+        start = position + 1;
+    }
+    if line == wanted { &text[start..] } else { "" }
 }
 
 fn editor_present_document_rows(
@@ -5542,7 +9137,7 @@ fn editor_present_document_rows(
     editor.present_frame.clear();
     editor
         .present_frame
-        .extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        .extend_from_slice(b"\x1b[?2026h\x1b[?7l\x1b[?25l");
     for (row, range) in row_ranges.iter().enumerate() {
         let hash = render_bytes_hash(&editor.frame[range.clone()]);
         let overlay_dirty = dirty_overlay_start.is_some_and(|start| row >= start);
@@ -5568,6 +9163,42 @@ fn render_bytes_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn buffer_terminal_column(buffer: &GapBuffer, position: usize, tab_width: usize) -> usize {
+    profiling::function_scope!();
+    let mut byte_position = buffer_line_start(buffer, position);
+    let mut column = 0;
+    while byte_position < position.min(buffer_len(buffer)) {
+        let byte = buffer_byte(buffer, byte_position);
+        if byte == b'\t' {
+            column += tab_width - column % tab_width;
+            byte_position += 1;
+        } else if byte.is_ascii() {
+            column += 1;
+            byte_position += 1;
+        } else {
+            let (character, next) = buffer_decode_char(buffer, byte_position);
+            column += terminal::terminal_character_width(character);
+            byte_position = next;
+        }
+    }
+    column
+}
+
+fn append_buffer_character_within_terminal_width(
+    buffer: &GapBuffer,
+    position: usize,
+    column: usize,
+    line_width: usize,
+    result: &mut Vec<u8, impl Allocator>,
+) -> (usize, usize) {
+    let (character, next) = buffer_decode_char(buffer, position);
+    let character_width = terminal::terminal_character_width(character);
+    if column + character_width <= line_width && (character_width > 0 || column > 0) {
+        buffer_append_range(buffer, position, next, result);
+    }
+    (next, character_width)
+}
+
 fn editor_render_picker(
     editor: &mut Editor,
     terminal: &mut Terminal,
@@ -5587,140 +9218,1147 @@ fn editor_render_picker(
         PickerKind::DocumentDiagnostics => "document diagnostics",
         PickerKind::WorkspaceDiagnostics => "workspace diagnostics",
     };
+    let horizontal_margin = (width / 12).clamp(2, 12);
+    let vertical_margin = (height / 10).clamp(1, 4);
+    let dialog_width = width.saturating_sub(horizontal_margin * 2).max(1);
+    let dialog_height = height.saturating_sub(vertical_margin * 2).max(1);
+    let dialog_column = width.saturating_sub(dialog_width) / 2 + 1;
+    let dialog_row = height.saturating_sub(dialog_height) / 2 + 1;
+    let content_width = dialog_width.saturating_sub(2);
+    let result_rows = dialog_height.saturating_sub(4);
+    let split = picker.preview.is_some() && content_width >= 60;
+    let list_width = if split {
+        content_width * 2 / 5
+    } else {
+        content_width
+    };
+    let preview_width = content_width.saturating_sub(list_width + usize::from(split));
+    let visible_len = picker_visible_len(editor, picker);
+    let first = if picker.selected < picker.first_visible {
+        picker.selected
+    } else if picker.selected >= picker.first_visible + result_rows.max(1) {
+        picker.selected + 1 - result_rows.max(1)
+    } else {
+        picker.first_visible
+    };
+    let scrollbar = visible_len > result_rows && list_width >= 3;
+    let scrollbar_row = if scrollbar {
+        first.saturating_mul(result_rows.saturating_sub(1))
+            / visible_len.saturating_sub(result_rows).max(1)
+    } else {
+        0
+    };
+
     editor.frame.clear();
     editor
         .frame
-        .extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[H");
+        .extend_from_slice(b"\x1b[?2026h\x1b[?7l\x1b[?25l");
     editor.frame.extend_from_slice(theme.cursor_color);
-    editor.frame.extend_from_slice(theme.normal);
-    let match_count = if picker.kind == PickerKind::Files && picker.query.is_empty() {
-        editor.project.labels.len()
-    } else {
-        picker.matches.len()
-    };
-    write!(
+    editor.frame.extend_from_slice(theme.status);
+    picker_render_border_row(
         &mut editor.frame,
-        " {title}  {} matches{}",
-        match_count,
-        if picker.kind == PickerKind::Files && editor.project_discovery.is_some() {
-            "  scanning"
-        } else if picker.kind == PickerKind::SearchProject && !picker.search_complete {
-            "  searching"
-        } else {
-            ""
-        }
-    )
-    .unwrap();
-    editor.frame.extend_from_slice(b"\x1b[K\r\n");
-    let result_rows = height.saturating_sub(2);
-    let first = picker
-        .selected
-        .saturating_sub(result_rows.saturating_sub(1));
+        dialog_row,
+        dialog_column,
+        dialog_width,
+        title,
+        visible_len,
+    );
+    picker_render_text_row(
+        &mut editor.frame,
+        dialog_row + 1,
+        dialog_column,
+        content_width,
+        "> ",
+        &picker.query,
+        theme.status,
+    );
+    picker_render_separator_row(
+        &mut editor.frame,
+        dialog_row + 2,
+        dialog_column,
+        dialog_width,
+        split.then_some(list_width),
+        false,
+    );
     for visible in 0..result_rows {
         let match_position = first + visible;
-        let item = if picker.kind == PickerKind::Files && picker.query.is_empty() {
-            (match_position < editor.project.labels.len()).then_some(match_position)
-        } else if picker.kind == PickerKind::Files {
-            picker
-                .search_ranked
-                .get(match_position)
-                .map(|found| found.item)
-        } else if picker.kind == PickerKind::SearchProject {
-            picker
-                .search_ranked
-                .get(match_position)
-                .map(|found| found.item)
+        let item = picker_item_at(editor, picker, match_position);
+        write!(
+            &mut editor.frame,
+            "\x1b[{};{}H",
+            dialog_row + 3 + visible,
+            dialog_column
+        )
+        .unwrap();
+        editor.frame.extend_from_slice(theme.status);
+        editor.frame.extend_from_slice("│".as_bytes());
+        let selected = match_position == picker.selected && item.is_some();
+        editor.frame.extend_from_slice(if selected {
+            theme.picker_selected
         } else {
-            picker.matches.get(match_position).map(|found| found.item)
-        };
+            theme.status
+        });
+        editor
+            .frame
+            .extend_from_slice(if selected { b"> " } else { b"  " });
         if let Some(item) = item {
-            editor
-                .frame
-                .extend_from_slice(if match_position == picker.selected {
-                    theme.picker_selected
-                } else {
-                    theme.normal
-                });
-            editor
-                .frame
-                .extend_from_slice(if match_position == picker.selected {
-                    b"> "
-                } else {
-                    b"  "
-                });
-            let label = match picker.kind {
-                PickerKind::Files => editor.project.labels[item].as_str(),
-                PickerKind::Commands => {
-                    if command_theme_argument(&picker.query).is_some() {
-                        THEME_NAMES[item]
-                    } else if command_file_argument(&picker.query).is_some() {
-                        editor.project.labels[item].as_str()
-                    } else {
-                        COMMANDS[item]
-                    }
-                }
-                PickerKind::SearchProject => {
-                    let Some(corpus) = editor.project_search.as_ref() else {
-                        continue;
-                    };
-                    let line = corpus.lines[item];
-                    std::str::from_utf8(
-                        &corpus.bytes[line.display_start as usize..line.display_end as usize],
-                    )
-                    .unwrap_or("")
-                }
-                PickerKind::DocumentSymbols => {
-                    let line = picker.symbol_corpus.lines[picker.symbol_candidates[item]];
-                    std::str::from_utf8(
-                        &picker.symbol_corpus.bytes
-                            [line.display_start as usize..line.display_end as usize],
-                    )
-                    .unwrap_or("")
-                }
-                PickerKind::WorkspaceSymbols => {
-                    let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
-                        continue;
-                    };
-                    rust_symbol_name(&editor.rust_methods.corpus, symbol)
-                }
-                PickerKind::References => {
-                    let line = picker.symbol_corpus.lines[item];
-                    std::str::from_utf8(
-                        &picker.symbol_corpus.bytes
-                            [line.display_start as usize..line.display_end as usize],
-                    )
-                    .unwrap_or("")
-                }
-                PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
-                    let diagnostic = picker.diagnostic_candidates[item];
-                    editor.diagnostics.published[diagnostic].display.as_str()
-                }
-            };
-            let mut end = label.len().min(width.saturating_sub(2));
-            while !label.is_char_boundary(end) {
-                end -= 1;
+            if !selected
+                && matches!(
+                    picker.kind,
+                    PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics
+                )
+                && let Some(diagnostic) = picker
+                    .diagnostic_candidates
+                    .get(item)
+                    .and_then(|&index| editor.diagnostics.published.get(index))
+            {
+                editor
+                    .frame
+                    .extend_from_slice(diagnostic_severity_style(diagnostic.severity, theme));
             }
-            editor.frame.extend_from_slice(&label.as_bytes()[..end]);
+            let label = picker_item_label(
+                &editor.project.labels,
+                editor.project_search.as_ref(),
+                &editor.rust_methods,
+                &editor.diagnostics,
+                picker,
+                item,
+            );
+            let label_width = list_width.saturating_sub(2 + usize::from(scrollbar));
+            append_terminal_text(label, label_width, &mut editor.frame);
+            let rendered_label = terminal_text_width(label, label_width);
+            append_spaces(
+                list_width.saturating_sub(2 + rendered_label + usize::from(scrollbar)),
+                &mut editor.frame,
+            );
+        } else {
+            append_spaces(
+                list_width.saturating_sub(2 + usize::from(scrollbar)),
+                &mut editor.frame,
+            );
         }
-        editor.frame.extend_from_slice(theme.normal);
-        editor.frame.extend_from_slice(b"\x1b[K");
-        if visible + 1 < result_rows {
-            editor.frame.extend_from_slice(b"\r\n");
+        if scrollbar {
+            editor.frame.extend_from_slice(
+                if visible == scrollbar_row {
+                    "█"
+                } else {
+                    "│"
+                }
+                .as_bytes(),
+            );
         }
+        editor.frame.extend_from_slice(theme.status);
+        if split {
+            editor.frame.extend_from_slice("│".as_bytes());
+            if let Some(preview) = picker.preview.as_ref() {
+                picker_render_syntax_preview_line(
+                    preview,
+                    visible,
+                    result_rows,
+                    preview_width,
+                    theme,
+                    &mut editor.frame,
+                );
+            } else {
+                append_spaces(preview_width, &mut editor.frame);
+            }
+        }
+        editor.frame.extend_from_slice(theme.status);
+        editor.frame.extend_from_slice("│".as_bytes());
     }
-    write!(&mut editor.frame, "\x1b[{};1H", height).unwrap();
-    editor.frame.extend_from_slice(theme.status);
-    write!(&mut editor.frame, "> {}\x1b[K", picker.query).unwrap();
-    editor.frame.extend_from_slice(theme.normal);
-    let query_column = (picker.query.chars().count() + 3).min(width);
+    picker_render_separator_row(
+        &mut editor.frame,
+        dialog_row + dialog_height - 1,
+        dialog_column,
+        dialog_width,
+        split.then_some(list_width),
+        true,
+    );
+    let query_column =
+        (dialog_column + 3 + terminal_text_width(&picker.query, content_width.saturating_sub(2)))
+            .min(dialog_column + dialog_width.saturating_sub(2));
     write!(
         &mut editor.frame,
         "\x1b[{};{}H\x1b[6 q\x1b[?25h",
-        height, query_column
+        dialog_row + 1,
+        query_column
     )
     .unwrap();
-    editor.frame.extend_from_slice(b"\x1b[?2026l");
+    editor.frame.extend_from_slice(b"\x1b[?7h\x1b[?2026l");
     terminal::terminal_present(terminal, &editor.frame)
+}
+
+fn diagnostic_severity_style(severity: DiagnosticSeverity, theme: &Theme) -> &'static [u8] {
+    match severity {
+        DiagnosticSeverity::Error => theme.git_removed,
+        DiagnosticSeverity::Warning => theme.git_modified,
+        DiagnosticSeverity::Info => theme.syntax[SyntaxKind::CommentNote as usize],
+    }
+}
+
+fn picker_item_at(editor: &Editor, picker: &Picker, position: usize) -> Option<usize> {
+    if picker.kind == PickerKind::Files && picker.query.is_empty() {
+        (position < editor.project.labels.len()).then_some(position)
+    } else if picker.kind == PickerKind::Files || picker.kind == PickerKind::SearchProject {
+        picker.search_ranked.get(position).map(|found| found.item)
+    } else {
+        picker.matches.get(position).map(|found| found.item)
+    }
+}
+
+fn picker_item_label<'a>(
+    project_labels: &'a [String],
+    project_search: Option<&'a SearchCorpus>,
+    rust_methods: &'a RustMethodIndex,
+    diagnostics: &'a Diagnostics,
+    picker: &'a Picker,
+    item: usize,
+) -> &'a str {
+    match picker.kind {
+        PickerKind::Files => project_labels[item].as_str(),
+        PickerKind::Commands => {
+            if command_theme_argument(&picker.query).is_some() {
+                THEME_NAMES[item]
+            } else if command_file_argument(&picker.query).is_some() {
+                project_labels[item].as_str()
+            } else {
+                COMMANDS[item]
+            }
+        }
+        PickerKind::SearchProject => {
+            let Some(corpus) = project_search else {
+                return "";
+            };
+            let line = corpus.lines[item];
+            std::str::from_utf8(
+                &corpus.bytes[line.display_start as usize..line.display_end as usize],
+            )
+            .unwrap_or("")
+        }
+        PickerKind::DocumentSymbols => {
+            let line = picker.symbol_corpus.lines[picker.symbol_candidates[item]];
+            let source =
+                &picker.symbol_corpus.bytes[line.text_start as usize..line.display_end as usize];
+            let Some((start, end)) = rust_symbol_name_range(source) else {
+                return "";
+            };
+            std::str::from_utf8(&source[start..end]).unwrap_or("")
+        }
+        PickerKind::WorkspaceSymbols => {
+            let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
+                return "";
+            };
+            rust_symbol_name(&rust_methods.corpus, symbol)
+        }
+        PickerKind::References => {
+            let line = picker.symbol_corpus.lines[item];
+            std::str::from_utf8(
+                &picker.symbol_corpus.bytes[line.display_start as usize..line.display_end as usize],
+            )
+            .unwrap_or("")
+        }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            let diagnostic = picker.diagnostic_candidates[item];
+            diagnostics.published[diagnostic].display.as_str()
+        }
+    }
+}
+
+fn picker_preview_location<'a>(
+    project_search: Option<&'a SearchCorpus>,
+    project_paths: &[std::path::PathBuf],
+    rust_methods: &RustMethodIndex,
+    diagnostics: &Diagnostics,
+    picker: &'a Picker,
+    item: Option<usize>,
+) -> Option<PickerPreview<'a>> {
+    let item = match item {
+        Some(item) => item,
+        None => return None,
+    };
+    match picker.kind {
+        PickerKind::Files => {
+            let corpus = match project_search {
+                Some(corpus) => corpus,
+                None => return None,
+            };
+            let start = corpus
+                .lines
+                .partition_point(|line| line.project_file < item as u32);
+            let end = corpus
+                .lines
+                .partition_point(|line| line.project_file <= item as u32);
+            (start < corpus.lines.len() && corpus.lines[start].project_file == item as u32)
+                .then_some(PickerPreview {
+                    corpus,
+                    target: start,
+                    file_start: start,
+                    file_end: end,
+                })
+        }
+        PickerKind::SearchProject => {
+            let corpus = match project_search {
+                Some(corpus) => corpus,
+                None => return None,
+            };
+            let line = match corpus.lines.get(item) {
+                Some(line) => *line,
+                None => return None,
+            };
+            let start = corpus
+                .lines
+                .partition_point(|candidate| candidate.project_file < line.project_file);
+            let end = corpus
+                .lines
+                .partition_point(|candidate| candidate.project_file <= line.project_file);
+            Some(PickerPreview {
+                corpus,
+                target: item,
+                file_start: start,
+                file_end: end,
+            })
+        }
+        PickerKind::DocumentSymbols => {
+            let line = match picker.symbol_candidates.get(item) {
+                Some(line) => *line,
+                None => return None,
+            };
+            Some(PickerPreview {
+                corpus: &picker.symbol_corpus,
+                target: line,
+                file_start: 0,
+                file_end: picker.symbol_corpus.lines.len(),
+            })
+        }
+        PickerKind::WorkspaceSymbols => {
+            let symbol = match picker.rust_symbol_candidates.get(item) {
+                Some(symbol) => *symbol,
+                None => return None,
+            };
+            let definition = match rust_methods.corpus.symbols.get(symbol) {
+                Some(definition) => *definition,
+                None => return None,
+            };
+            let path = match rust_methods.corpus.paths.get(definition.path as usize) {
+                Some(path) => path,
+                None => return None,
+            };
+            let project_file = match project_paths.iter().position(|candidate| candidate == path) {
+                Some(project_file) => project_file,
+                None => return None,
+            };
+            let corpus = match project_search {
+                Some(corpus) => corpus,
+                None => return None,
+            };
+            project_preview_location(corpus, project_file, definition.position)
+        }
+        PickerKind::References => {
+            let target = match picker.reference_targets.get(item) {
+                Some(target) => *target,
+                None => return None,
+            };
+            if target.project_file == u32::MAX {
+                document_preview_location(&picker.preview_corpus, target.start as usize)
+            } else {
+                let corpus = match project_search {
+                    Some(corpus) => corpus,
+                    None => return None,
+                };
+                project_preview_location(corpus, target.project_file as usize, target.start)
+            }
+        }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            let diagnostic = match picker.diagnostic_candidates.get(item) {
+                Some(diagnostic) => *diagnostic,
+                None => return None,
+            };
+            let diagnostic = match diagnostics.published.get(diagnostic) {
+                Some(diagnostic) => diagnostic,
+                None => return None,
+            };
+            let project_file = match project_paths
+                .iter()
+                .position(|candidate| candidate == &diagnostic.path)
+            {
+                Some(project_file) => project_file,
+                None => return None,
+            };
+            let corpus = match project_search {
+                Some(corpus) => corpus,
+                None => return None,
+            };
+            let file_start = corpus
+                .lines
+                .partition_point(|line| line.project_file < project_file as u32);
+            let target = file_start + diagnostic.line as usize;
+            project_preview_location(
+                corpus,
+                project_file,
+                corpus.lines.get(target).map_or(0, |line| line.file_offset),
+            )
+        }
+        PickerKind::Commands => None,
+    }
+}
+
+fn picker_rebuild_preview(editor: &Editor, picker: &mut Picker) {
+    profiling::function_scope!();
+    let item = match picker_item_at(editor, picker, picker.selected) {
+        Some(item) => item,
+        None => {
+            picker.preview = None;
+            return;
+        }
+    };
+    let key = PickerPreviewKey {
+        kind: picker.kind,
+        item,
+    };
+    if picker
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.key == key)
+    {
+        return;
+    }
+    let location = match picker_preview_location(
+        editor.project_search.as_ref(),
+        &editor.project.paths,
+        &editor.rust_methods,
+        &editor.diagnostics,
+        picker,
+        Some(item),
+    ) {
+        Some(location) => location,
+        None => {
+            picker.preview = None;
+            picker_start_workspace_symbol_preview_load(editor, picker, key, item);
+            return;
+        }
+    };
+    let maximum_lines = 256;
+    let mut first = location
+        .target
+        .saturating_sub(maximum_lines / 2)
+        .max(location.file_start);
+    let end = (first + maximum_lines).min(location.file_end);
+    first = end.saturating_sub(maximum_lines).max(location.file_start);
+    let temp = idno_std::mem().scratch().temp();
+    let mut source = temp.vec(64 * 1024);
+    for line in &location.corpus.lines[first..end] {
+        source.extend_from_slice(
+            &location.corpus.bytes[line.text_start as usize..line.display_end as usize],
+        );
+        source.push(b'\n');
+    }
+    let target_line = location.target - first;
+    let first_line_number = first - location.file_start + 1;
+    let file_offset = location.corpus.lines[first].file_offset as usize;
+    let target_range = picker_preview_target_range(editor, picker, item);
+    let target_start = target_range.map_or(0, |range| range.0.saturating_sub(file_offset));
+    let target_end = target_range.map_or(0, |range| range.1.saturating_sub(file_offset));
+    let path = picker_preview_path(editor, picker, item);
+    if let Some(task) = picker.preview_load_task.take() {
+        task.cancel();
+    }
+    picker.preview_load_key = None;
+    picker_preview_cache_set(
+        picker,
+        key,
+        path,
+        &source,
+        target_line,
+        target_start..target_end,
+        first_line_number,
+    );
+}
+
+fn picker_preview_cache_set(
+    picker: &mut Picker,
+    key: PickerPreviewKey,
+    path: Option<&std::path::Path>,
+    source: &[u8],
+    target_line: usize,
+    target_range: std::ops::Range<usize>,
+    first_line_number: usize,
+) {
+    profiling::function_scope!();
+    let mut preview = match picker.preview.take() {
+        Some(mut preview) => {
+            let length = buffer_len(&preview.buffer);
+            buffer_delete(&mut preview.buffer, 0, length);
+            buffer_insert(&mut preview.buffer, 0, source);
+            preview
+        }
+        None => PickerPreviewCache {
+            key,
+            buffer: buffer_from_bytes(source),
+            syntax: syntax_highlighting_empty(),
+            target_line: 0,
+            target_start: 0,
+            target_end: 0,
+            first_line_number: 1,
+        },
+    };
+    preview.key = key;
+    preview.target_line = target_line;
+    preview.target_start = target_range.start;
+    preview.target_end = target_range.end;
+    preview.first_line_number = first_line_number;
+    syntax_highlighting_set_path(&mut preview.syntax, path);
+    syntax_highlighting_step(
+        &preview.buffer,
+        &mut preview.syntax,
+        256 * 1024,
+        std::time::Duration::from_micros(500),
+    );
+    picker.preview = Some(preview);
+}
+
+fn picker_start_workspace_symbol_preview_load(
+    editor: &Editor,
+    picker: &mut Picker,
+    key: PickerPreviewKey,
+    item: usize,
+) {
+    profiling::function_scope!();
+    if picker.kind != PickerKind::WorkspaceSymbols || picker.preview_load_key == Some(key) {
+        return;
+    }
+    let Some(&symbol) = picker.rust_symbol_candidates.get(item) else {
+        return;
+    };
+    let Some(definition) = editor.rust_methods.corpus.symbols.get(symbol).copied() else {
+        return;
+    };
+    let Some(path) = rust_symbol_path(&editor.rust_methods.corpus, symbol) else {
+        return;
+    };
+    if let Some(task) = picker.preview_load_task.take() {
+        task.cancel();
+    }
+    let path = path.to_path_buf();
+    let target = definition.position as usize;
+    let target_end = definition.end as usize;
+    picker.preview_load_key = Some(key);
+    picker.preview_load_task = Some(
+        idno_std::threads().spawn_owned(move || picker_preview_load(key, path, target, target_end)),
+    );
+}
+
+fn picker_preview_load(
+    key: PickerPreviewKey,
+    path: std::path::PathBuf,
+    target: usize,
+    target_end: usize,
+) -> PickerPreviewLoad {
+    profiling::function_scope!();
+    let mut bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return PickerPreviewLoad {
+                key,
+                path,
+                bytes: Vec::new(),
+                target_line: 0,
+                target_start: 0,
+                target_end: 0,
+                first_line_number: 1,
+                available: false,
+            };
+        }
+    };
+    let target = target.min(bytes.len());
+    let target_end = target_end.min(bytes.len());
+    let absolute_target_line = bytes[..target]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    let first_line = absolute_target_line.saturating_sub(128);
+    let last_line = first_line + 256;
+    let mut line = 0usize;
+    let mut first_byte = 0usize;
+    let mut last_byte = bytes.len();
+    for (position, &byte) in bytes.iter().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+        line += 1;
+        if line == first_line {
+            first_byte = position + 1;
+        }
+        if line == last_line {
+            last_byte = position + 1;
+            break;
+        }
+    }
+    bytes.copy_within(first_byte..last_byte, 0);
+    bytes.truncate(last_byte - first_byte);
+    PickerPreviewLoad {
+        key,
+        path,
+        bytes,
+        target_line: absolute_target_line - first_line,
+        target_start: target.saturating_sub(first_byte),
+        target_end: target_end.saturating_sub(first_byte),
+        first_line_number: first_line + 1,
+        available: true,
+    }
+}
+
+fn picker_preview_path<'a>(
+    editor: &'a Editor,
+    picker: &Picker,
+    item: usize,
+) -> Option<&'a std::path::Path> {
+    match picker.kind {
+        PickerKind::Files => editor
+            .project
+            .paths
+            .get(item)
+            .map(std::path::PathBuf::as_path),
+        PickerKind::SearchProject => {
+            let corpus = match editor.project_search.as_ref() {
+                Some(corpus) => corpus,
+                None => return None,
+            };
+            let line = match corpus.lines.get(item) {
+                Some(line) => line,
+                None => return None,
+            };
+            editor
+                .project
+                .paths
+                .get(line.project_file as usize)
+                .map(std::path::PathBuf::as_path)
+        }
+        PickerKind::DocumentSymbols => editor_document(editor).path.as_deref(),
+        PickerKind::WorkspaceSymbols => {
+            let symbol = match picker.rust_symbol_candidates.get(item) {
+                Some(symbol) => *symbol,
+                None => return None,
+            };
+            rust_symbol_path(&editor.rust_methods.corpus, symbol)
+        }
+        PickerKind::References => {
+            let target = match picker.reference_targets.get(item) {
+                Some(target) => target,
+                None => return None,
+            };
+            if target.project_file == u32::MAX {
+                editor_document(editor).path.as_deref()
+            } else {
+                editor
+                    .project
+                    .paths
+                    .get(target.project_file as usize)
+                    .map(std::path::PathBuf::as_path)
+            }
+        }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            let diagnostic = match picker.diagnostic_candidates.get(item) {
+                Some(diagnostic) => *diagnostic,
+                None => return None,
+            };
+            editor
+                .diagnostics
+                .published
+                .get(diagnostic)
+                .map(|diagnostic| diagnostic.path.as_path())
+        }
+        PickerKind::Commands => None,
+    }
+}
+
+fn picker_preview_target_range(
+    editor: &Editor,
+    picker: &Picker,
+    item: usize,
+) -> Option<(usize, usize)> {
+    match picker.kind {
+        PickerKind::WorkspaceSymbols => {
+            let symbol = match picker.rust_symbol_candidates.get(item) {
+                Some(symbol) => *symbol,
+                None => return None,
+            };
+            let definition = match editor.rust_methods.corpus.symbols.get(symbol) {
+                Some(definition) => definition,
+                None => return None,
+            };
+            Some((definition.position as usize, definition.end as usize))
+        }
+        PickerKind::References => {
+            let target = match picker.reference_targets.get(item) {
+                Some(target) => target,
+                None => return None,
+            };
+            Some((target.start as usize, target.end as usize))
+        }
+        PickerKind::DocumentSymbols => {
+            let line = match picker
+                .symbol_candidates
+                .get(item)
+                .and_then(|&line| picker.symbol_corpus.lines.get(line))
+            {
+                Some(line) => line,
+                None => return None,
+            };
+            let source =
+                &picker.symbol_corpus.bytes[line.text_start as usize..line.display_end as usize];
+            let (start, end) = match rust_symbol_name_range(source) {
+                Some(range) => range,
+                None => return None,
+            };
+            Some((
+                line.file_offset as usize + start,
+                line.file_offset as usize + end,
+            ))
+        }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            let Some(diagnostic) = picker
+                .diagnostic_candidates
+                .get(item)
+                .and_then(|&index| editor.diagnostics.published.get(index))
+            else {
+                return None;
+            };
+            let Some(corpus) = editor.project_search.as_ref() else {
+                return None;
+            };
+            let Some(project_file) = editor
+                .project
+                .paths
+                .iter()
+                .position(|path| path == &diagnostic.path)
+            else {
+                return None;
+            };
+            let file_start = corpus
+                .lines
+                .partition_point(|line| line.project_file < project_file as u32);
+            let Some(start_line) = corpus.lines.get(file_start + diagnostic.line as usize) else {
+                return None;
+            };
+            let Some(end_line) = corpus.lines.get(file_start + diagnostic.end_line as usize) else {
+                return None;
+            };
+            let start_source =
+                &corpus.bytes[start_line.text_start as usize..start_line.display_end as usize];
+            let end_source =
+                &corpus.bytes[end_line.text_start as usize..end_line.display_end as usize];
+            let start = start_line.file_offset as usize
+                + utf8_character_column_offset(start_source, diagnostic.column as usize);
+            let mut end = end_line.file_offset as usize
+                + utf8_character_column_offset(end_source, diagnostic.end_column as usize);
+            if end <= start {
+                end = start
+                    + utf8_character_width_at(
+                        start_source,
+                        utf8_character_column_offset(start_source, diagnostic.column as usize),
+                    );
+            }
+            Some((start, end))
+        }
+        _ => None,
+    }
+}
+
+fn utf8_character_column_offset(source: &[u8], column: usize) -> usize {
+    profiling::function_scope!();
+    let Ok(source) = std::str::from_utf8(source) else {
+        return column.min(source.len());
+    };
+    source
+        .char_indices()
+        .nth(column)
+        .map_or(source.len(), |(position, _)| position)
+}
+
+fn utf8_character_width_at(source: &[u8], position: usize) -> usize {
+    let Some(&byte) = source.get(position) else {
+        return 0;
+    };
+    if byte < 0x80 {
+        1
+    } else if byte < 0xe0 {
+        2.min(source.len() - position)
+    } else if byte < 0xf0 {
+        3.min(source.len() - position)
+    } else {
+        4.min(source.len() - position)
+    }
+}
+
+fn project_preview_location(
+    corpus: &SearchCorpus,
+    project_file: usize,
+    file_offset: u32,
+) -> Option<PickerPreview<'_>> {
+    let start = corpus
+        .lines
+        .partition_point(|line| line.project_file < project_file as u32);
+    let end = corpus
+        .lines
+        .partition_point(|line| line.project_file <= project_file as u32);
+    if start == end {
+        return None;
+    }
+    let relative = corpus.lines[start..end]
+        .partition_point(|line| line.file_offset <= file_offset)
+        .saturating_sub(1);
+    Some(PickerPreview {
+        corpus,
+        target: start + relative,
+        file_start: start,
+        file_end: end,
+    })
+}
+
+fn document_preview_location(
+    corpus: &SearchCorpus,
+    file_offset: usize,
+) -> Option<PickerPreview<'_>> {
+    if corpus.lines.is_empty() {
+        return None;
+    }
+    let target = corpus
+        .lines
+        .partition_point(|line| line.file_offset as usize <= file_offset)
+        .saturating_sub(1);
+    Some(PickerPreview {
+        corpus,
+        target,
+        file_start: 0,
+        file_end: corpus.lines.len(),
+    })
+}
+
+fn picker_render_syntax_preview_line(
+    preview: &PickerPreviewCache,
+    visible: usize,
+    result_rows: usize,
+    width: usize,
+    theme: &Theme,
+    result: &mut Vec<u8, impl Allocator>,
+) {
+    let total_lines = buffer_line_count(&preview.buffer);
+    let maximum_first = total_lines.saturating_sub(result_rows);
+    let first = preview
+        .target_line
+        .saturating_sub(result_rows / 2)
+        .min(maximum_first);
+    let line = first + visible;
+    if line >= total_lines {
+        result.extend_from_slice(theme.gutter);
+        append_spaces(5.min(width), result);
+        if width > 5 {
+            result.extend_from_slice("~".as_bytes());
+            append_spaces(width - 6, result);
+        }
+        return;
+    }
+    let selected_line = line == preview.target_line;
+    result.extend_from_slice(theme.gutter);
+    if selected_line {
+        result.extend_from_slice(theme.preview_line_background);
+    }
+    let line_number = preview.first_line_number + line;
+    let prefix_width = 6.min(width);
+    write!(
+        result,
+        "{:>number_width$} ",
+        line_number,
+        number_width = prefix_width.saturating_sub(1)
+    )
+    .unwrap();
+    result.extend_from_slice(theme.normal);
+    if selected_line {
+        result.extend_from_slice(theme.preview_line_background);
+    }
+    let mut position = buffer_position_at_line_column(&preview.buffer, line, 0);
+    let line_end = buffer_line_end(&preview.buffer, position);
+    let text_width = width.saturating_sub(prefix_width);
+    let spans = syntax_highlighting_spans(&preview.syntax);
+    let mut span_position = spans.partition_point(|span| span.end as usize <= position);
+    let mut rendered_style = usize::MAX;
+    let mut column = 0;
+    while position < line_end && column < text_width {
+        while span_position < spans.len() && spans[span_position].end as usize <= position {
+            span_position += 1;
+        }
+        let syntax_style = spans
+            .get(span_position)
+            .filter(|span| span.start as usize <= position && position < span.end as usize)
+            .map_or(0, |span| span.kind as usize + 1);
+        let symbol_selected = preview.target_start <= position && position < preview.target_end;
+        let style = syntax_style | if symbol_selected { 1 << 8 } else { 0 };
+        if style != rendered_style {
+            result.extend_from_slice(if syntax_style == 0 {
+                theme.normal
+            } else {
+                theme.syntax[syntax_style - 1]
+            });
+            if symbol_selected {
+                result.extend_from_slice(theme.picker_selected);
+            } else if selected_line {
+                result.extend_from_slice(theme.preview_line_background);
+            }
+            rendered_style = style;
+        }
+        let byte = buffer_byte(&preview.buffer, position);
+        match byte {
+            b'\t' => {
+                let spaces = (4 - column % 4).min(text_width - column);
+                append_spaces(spaces, result);
+                column += spaces;
+                position += 1;
+            }
+            0x00..=0x1f | 0x7f => {
+                result.push(b'?');
+                column += 1;
+                position += 1;
+            }
+            0x20..=0x7e => {
+                result.push(byte);
+                column += 1;
+                position += 1;
+            }
+            _ => {
+                let (next, character_width) = append_buffer_character_within_terminal_width(
+                    &preview.buffer,
+                    position,
+                    column,
+                    text_width,
+                    result,
+                );
+                if column + character_width > text_width {
+                    break;
+                }
+                column += character_width;
+                position = next;
+            }
+        }
+    }
+    result.extend_from_slice(theme.normal);
+    if selected_line {
+        result.extend_from_slice(theme.preview_line_background);
+    }
+    append_spaces(text_width.saturating_sub(column), result);
+}
+
+fn picker_render_border_row(
+    result: &mut Vec<u8, impl Allocator>,
+    row: usize,
+    column: usize,
+    width: usize,
+    title: &str,
+    matches: usize,
+) {
+    write!(result, "\x1b[{row};{column}H").unwrap();
+    result.extend_from_slice("┌".as_bytes());
+    let inner = width.saturating_sub(2);
+    write!(result, " {title}  {matches} ").unwrap();
+    let match_digits = if matches == 0 {
+        1
+    } else {
+        matches.ilog10() as usize + 1
+    };
+    let used = title.len() + match_digits + 4;
+    append_repeated_text("─", inner.saturating_sub(used), result);
+    if width > 1 {
+        result.extend_from_slice("┐".as_bytes());
+    }
+}
+
+fn picker_render_separator_row(
+    result: &mut Vec<u8, impl Allocator>,
+    row: usize,
+    column: usize,
+    width: usize,
+    split: Option<usize>,
+    bottom: bool,
+) {
+    write!(result, "\x1b[{row};{column}H").unwrap();
+    result.extend_from_slice(if bottom {
+        "└".as_bytes()
+    } else {
+        "├".as_bytes()
+    });
+    let inner = width.saturating_sub(2);
+    if let Some(left) = split {
+        append_repeated_text("─", left.min(inner), result);
+        if left < inner {
+            result.extend_from_slice(if bottom {
+                "┴".as_bytes()
+            } else {
+                "┼".as_bytes()
+            });
+            append_repeated_text("─", inner - left - 1, result);
+        }
+    } else {
+        append_repeated_text("─", inner, result);
+    }
+    if width > 1 {
+        result.extend_from_slice(if bottom {
+            "┘".as_bytes()
+        } else {
+            "┤".as_bytes()
+        });
+    }
+}
+
+fn picker_render_text_row(
+    result: &mut Vec<u8, impl Allocator>,
+    row: usize,
+    column: usize,
+    width: usize,
+    prefix: &str,
+    text: &str,
+    style: &[u8],
+) {
+    write!(result, "\x1b[{row};{column}H").unwrap();
+    result.extend_from_slice(style);
+    result.extend_from_slice("│".as_bytes());
+    append_terminal_text(prefix, width, result);
+    let prefix_width = terminal_text_width(prefix, width);
+    append_terminal_text(text, width.saturating_sub(prefix_width), result);
+    let used = prefix_width + terminal_text_width(text, width.saturating_sub(prefix_width));
+    append_spaces(width.saturating_sub(used), result);
+    result.extend_from_slice("│".as_bytes());
+}
+
+fn append_terminal_text(text: &str, width: usize, result: &mut Vec<u8, impl Allocator>) {
+    let mut column = 0;
+    for character in text.chars() {
+        let character_width = terminal::terminal_character_width(character);
+        if column + character_width > width {
+            break;
+        }
+        if character.is_control() {
+            result.push(b'?');
+            column += 1;
+        } else {
+            let mut bytes = [0; 4];
+            result.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
+            column += character_width;
+        }
+    }
+}
+
+fn append_rust_completion_text(
+    text: &[u8],
+    width: usize,
+    selection: Option<std::ops::Range<usize>>,
+    theme: &Theme,
+    black_background: bool,
+    result: &mut Vec<u8, impl Allocator>,
+) -> usize {
+    profiling::function_scope!();
+    let mut position = 0usize;
+    let mut column = 0usize;
+    let black = b"\x1b[48;2;0;0;0m".as_slice();
+    while position < text.len() && column < width {
+        let start = position;
+        let (end, style) = if text.get(position..position + 3) == Some(b"///")
+            || text.get(position..position + 3) == Some(b"//!")
+        {
+            (text.len(), Some(SyntaxKind::Comment))
+        } else if rust_identifier_byte(text[position]) {
+            position += 1;
+            while position < text.len() && rust_identifier_byte(text[position]) {
+                position += 1;
+            }
+            let word = &text[start..position];
+            let mut after = position;
+            while after < text.len() && text[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            let style = if matches!(
+                word,
+                b"pub"
+                    | b"fn"
+                    | b"mut"
+                    | b"const"
+                    | b"unsafe"
+                    | b"async"
+                    | b"where"
+                    | b"impl"
+                    | b"dyn"
+                    | b"self"
+                    | b"Self"
+            ) {
+                SyntaxKind::Keyword
+            } else if word.first().is_some_and(u8::is_ascii_uppercase) {
+                SyntaxKind::Type
+            } else if text.get(after) == Some(&b'(') {
+                SyntaxKind::Function
+            } else {
+                SyntaxKind::Markup
+            };
+            (position, Some(style))
+        } else {
+            position += 1;
+            let style = if matches!(
+                text[start],
+                b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' | b':' | b';'
+            ) {
+                SyntaxKind::Punctuation
+            } else if matches!(text[start], b'&' | b'*' | b'=' | b'+' | b'-' | b'>' | b'<') {
+                SyntaxKind::Operator
+            } else {
+                SyntaxKind::Markup
+            };
+            (position, Some(style))
+        };
+        let selected = selection
+            .as_ref()
+            .is_some_and(|selection| start < selection.end && selection.start < end);
+        result.extend_from_slice(style.map_or(theme.normal, |style| theme.syntax[style as usize]));
+        if black_background {
+            result.extend_from_slice(black);
+        }
+        if selected {
+            result.extend_from_slice(theme.selection_background);
+        }
+        let available = width - column;
+        let token = std::str::from_utf8(&text[start..end]).unwrap_or("");
+        append_terminal_text(token, available, result);
+        let rendered = terminal_text_width(token, available);
+        column += rendered;
+        if rendered < terminal_text_width(token, usize::MAX) {
+            break;
+        }
+    }
+    column
+}
+
+fn terminal_text_width(text: &str, limit: usize) -> usize {
+    let mut width = 0;
+    for character in text.chars() {
+        let character_width =
+            terminal::terminal_character_width(character).max(usize::from(character.is_control()));
+        if width + character_width > limit {
+            break;
+        }
+        width += character_width;
+    }
+    width
+}
+
+fn append_spaces(count: usize, result: &mut Vec<u8, impl Allocator>) {
+    append_repeated(b' ', count, result);
+}
+
+fn append_repeated(byte: u8, count: usize, result: &mut Vec<u8, impl Allocator>) {
+    result.extend(std::iter::repeat_n(byte, count));
+}
+
+fn append_repeated_text(text: &str, count: usize, result: &mut Vec<u8, impl Allocator>) {
+    result.reserve(text.len() * count);
+    for _ in 0..count {
+        result.extend_from_slice(text.as_bytes());
+    }
 }
 
 fn position_is_selected(
@@ -5732,6 +10370,18 @@ fn position_is_selected(
         let start = selection.anchor.min(selection.cursor);
         let end = buffer_next_char(buffer, selection.anchor.max(selection.cursor));
         (start..end).contains(&position)
+    })
+}
+
+fn position_is_visibly_selected(
+    buffer: &GapBuffer,
+    selections: &[SelectionState],
+    position: usize,
+    mode: Mode,
+) -> bool {
+    selections.iter().any(|selection| {
+        (mode != Mode::Insert || selection.anchor != selection.cursor)
+            && position_is_selected(buffer, std::slice::from_ref(selection), position)
     })
 }
 
@@ -5763,14 +10413,26 @@ mod tests {
     }
 
     #[test]
-    fn word_motions_create_and_extend_a_selection() {
+    fn word_motions_stop_before_helix_punctuation_boundaries() {
         let mut editor = editor_with_text("one two three");
         editor_handle_key(&mut editor, Key::Character('w'));
         assert_eq!(editor.mode, Mode::Normal);
         assert_eq!(editor_document(&editor).anchor, 0);
-        assert_eq!(editor_document(&editor).cursor, 4);
+        assert_eq!(editor_document(&editor).cursor, 3);
         editor_handle_key(&mut editor, Key::Character('w'));
-        assert_eq!(editor_document(&editor).cursor, 8);
+        assert_eq!(editor_document(&editor).anchor, 4);
+        assert_eq!(editor_document(&editor).cursor, 7);
+
+        let mut punctuation = editor_with_text("run()");
+        editor_handle_key(&mut punctuation, Key::Character('w'));
+        assert_eq!(editor_document(&punctuation).anchor, 0);
+        assert_eq!(editor_document(&punctuation).cursor, 2);
+        editor_handle_key(&mut punctuation, Key::Character('w'));
+        assert_eq!(editor_document(&punctuation).anchor, 3);
+        assert_eq!(editor_document(&punctuation).cursor, 4);
+        editor_handle_key(&mut punctuation, Key::Character('b'));
+        assert_eq!(editor_document(&punctuation).anchor, 4);
+        assert_eq!(editor_document(&punctuation).cursor, 3);
     }
 
     #[test]
@@ -5799,7 +10461,7 @@ mod tests {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
         let readme = directory.join("README.md");
         std::fs::write(&readme, b"readme").unwrap();
         std::fs::write(directory.join("main.rs"), b"fn main() {}").unwrap();
@@ -5845,7 +10507,7 @@ mod tests {
     }
 
     #[test]
-    fn goto_module_definition_opens_the_module_file() {
+    fn goto_module_definition_selects_the_declaration_before_opening_the_file() {
         static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let directory = std::env::temp_dir().join(format!(
@@ -5853,14 +10515,30 @@ mod tests {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
         let main = directory.join("main.rs");
         let module = directory.join("potato.rs");
-        std::fs::write(&main, b"mod potato;\nfn main() { grow(); }").unwrap();
+        let main_source = b"mod potato;\nfn main() { potato::grow(); }";
+        std::fs::write(&main, main_source).unwrap();
         std::fs::write(&module, b"pub fn grow() {}").unwrap();
         let mut editor = editor_open(Some(main)).unwrap();
-        editor.documents[0].cursor = 4;
-        editor.documents[0].anchor = 4;
+        let module_use = main_source
+            .windows(6)
+            .rposition(|word| word == b"potato")
+            .unwrap();
+        editor.documents[0].cursor = module_use;
+        editor.documents[0].anchor = module_use;
+        for key in ['g', 'd'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor.current, 0);
+        assert_eq!(
+            (
+                editor_document(&editor).cursor,
+                editor_document(&editor).anchor
+            ),
+            (4, 9)
+        );
         for key in ['g', 'd'] {
             editor_handle_key(&mut editor, Key::Character(key));
         }
@@ -5872,10 +10550,22 @@ mod tests {
                 .and_then(std::ffi::OsStr::to_str),
             Some("potato.rs")
         );
+        assert_eq!(editor_document(&editor).cursor, 0);
+        assert_eq!(
+            editor_document(&editor).anchor,
+            buffer_previous_char(
+                &editor_document(&editor).buffer,
+                buffer_len(&editor_document(&editor).buffer)
+            )
+        );
 
         editor_switch_document(&mut editor, 0);
-        editor.documents[0].cursor = 24;
-        editor.documents[0].anchor = 24;
+        let function_use = main_source
+            .windows(4)
+            .rposition(|word| word == b"grow")
+            .unwrap();
+        editor.documents[0].cursor = function_use;
+        editor.documents[0].anchor = function_use;
         for key in ['g', 'd'] {
             editor_handle_key(&mut editor, Key::Character(key));
         }
@@ -5896,7 +10586,7 @@ mod tests {
         );
         editor_handle_key(&mut editor, Key::Control(15));
         assert_eq!(editor.current, 0);
-        assert_eq!(editor_document(&editor).cursor, 24);
+        assert_eq!(editor_document(&editor).cursor, function_use);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -5945,6 +10635,9 @@ mod tests {
             PendingKey::Match,
             PendingKey::MatchAround,
             PendingKey::MatchInside,
+            PendingKey::MatchSurround,
+            PendingKey::MatchReplaceFrom,
+            PendingKey::MatchReplaceTo('{'),
             PendingKey::InsertLineAbove,
             PendingKey::InsertLineBelow,
         ] {
@@ -6045,11 +10738,122 @@ mod tests {
     }
 
     #[test]
+    fn shift_r_replaces_each_selection_from_the_internal_register_as_one_edit() {
+        let mut editor = editor_with_text("a\nb\nx\ny\n");
+        editor_handle_key(&mut editor, Key::Character('C'));
+        editor_handle_key(&mut editor, Key::Character('y'));
+        editor.documents[0].cursor = 4;
+        editor.documents[0].anchor = 4;
+        editor.documents[0].secondary_selections.clear();
+        editor.documents[0]
+            .secondary_selections
+            .push(SelectionState {
+                cursor: 6,
+                anchor: 6,
+            });
+
+        editor_handle_key(&mut editor, Key::Character('R'));
+
+        assert_eq!(contents(&editor), b"a\nb\na\nb\n");
+        assert_eq!(editor_document(&editor).secondary_selections.len(), 1);
+        assert_eq!(editor_document(&editor).undo.len(), 1);
+        document_undo(editor_document_mut(&mut editor));
+        assert_eq!(contents(&editor), b"a\nb\nx\ny\n");
+    }
+
+    #[test]
+    fn system_clipboard_replacement_replaces_every_selection_as_one_edit() {
+        let mut editor = editor_with_text("one\ntwo\n");
+        editor.documents[0].anchor = 0;
+        editor.documents[0].cursor = 2;
+        editor.documents[0]
+            .secondary_selections
+            .push(SelectionState {
+                anchor: 4,
+                cursor: 6,
+            });
+
+        editor_replace_selections(&mut editor, b"value");
+
+        assert_eq!(contents(&editor), b"value\nvalue\n");
+        assert_eq!(editor_document(&editor).secondary_selections.len(), 1);
+        assert_eq!(editor_document(&editor).undo.len(), 1);
+        document_undo(editor_document_mut(&mut editor));
+        assert_eq!(contents(&editor), b"one\ntwo\n");
+    }
+
+    #[test]
     fn enter_copies_indentation_and_indents_open_scopes() {
         let mut editor = editor_with_text("    {");
         editor_handle_key(&mut editor, Key::Character('A'));
         editor_handle_key(&mut editor, Key::Enter);
         assert_eq!(contents(&editor), b"    {\n        ");
+    }
+
+    #[test]
+    fn open_line_uses_enclosing_scope_instead_of_continuation_indentation() {
+        let source = "fn resolve(name: &str) -> String {\n    std::env::current_dir()\n        .map(|directory| directory.join(name).to_string_lossy().into_owned())\n        .unwrap_or_else(|_| name.to_string());\n}";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        syntax_highlighting_set_path(
+            &mut editor.documents[0].syntax,
+            Some(std::path::Path::new("main.rs")),
+        );
+        while !editor.documents[0].syntax.complete {
+            let document = &mut editor.documents[0];
+            syntax_highlighting_step(
+                &document.buffer,
+                &mut document.syntax,
+                usize::MAX,
+                std::time::Duration::MAX,
+            );
+        }
+        let continuation = source.find(".unwrap_or_else").unwrap();
+        editor.documents[0].cursor = continuation;
+        editor.documents[0].anchor = continuation;
+
+        editor_handle_key(&mut editor, Key::Character('o'));
+
+        assert!(contents(&editor).ends_with(b".unwrap_or_else(|_| name.to_string());\n    \n}"));
+        assert_eq!(
+            buffer_line_and_column(
+                &editor.documents[0].buffer,
+                editor.documents[0].insertion_points[0]
+            ),
+            (4, 4)
+        );
+    }
+
+    #[test]
+    fn open_line_retains_an_unfinished_boolean_continuation_indent() {
+        let source =
+            "fn check() {\n    if first\n        && second\n        && third\n    {\n    }\n}";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        syntax_highlighting_set_path(
+            &mut editor.documents[0].syntax,
+            Some(std::path::Path::new("main.rs")),
+        );
+        while !editor.documents[0].syntax.complete {
+            let document = &mut editor.documents[0];
+            syntax_highlighting_step(
+                &document.buffer,
+                &mut document.syntax,
+                usize::MAX,
+                std::time::Duration::MAX,
+            );
+        }
+        let continuation = source.find("&& second").unwrap();
+        editor.documents[0].cursor = continuation;
+        editor.documents[0].anchor = continuation;
+
+        editor_handle_key(&mut editor, Key::Character('o'));
+
+        let insertion = editor.documents[0].insertion_points[0];
+        assert_eq!(
+            buffer_line_and_column(&editor.documents[0].buffer, insertion),
+            (3, 8)
+        );
     }
 
     #[test]
@@ -6158,6 +10962,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_enter_keeps_only_the_active_lines_indentation() {
+        let mut editor = editor_with_text("    item");
+        editor_handle_key(&mut editor, Key::Character('A'));
+        editor_handle_key(&mut editor, Key::Enter);
+        editor_handle_key(&mut editor, Key::Enter);
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(contents(&editor), b"    item\n\n\n    ");
+        assert_eq!(editor_document(&editor).insertion_points, [15]);
+        editor_handle_key(&mut editor, Key::Character('x'));
+        assert_eq!(contents(&editor), b"    item\n\n\n    x");
+    }
+
+    #[test]
+    fn repeated_enter_after_o_keeps_cursor_on_the_active_indented_line() {
+        let mut editor = editor_with_text("fn main() {\n}");
+        editor_handle_key(&mut editor, Key::Character('o'));
+        editor_handle_key(&mut editor, Key::Enter);
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(contents(&editor), b"fn main() {\n\n\n    \n}");
+        assert_eq!(editor_document(&editor).insertion_points, [18]);
+        assert_eq!(
+            buffer_line_and_column(&editor_document(&editor).buffer, 18),
+            (3, 4)
+        );
+    }
+
+    #[test]
+    fn repeated_enter_after_i_does_not_leave_indented_intermediate_lines() {
+        let mut editor = editor_with_text("    value");
+        editor.documents[0].cursor = 4;
+        editor.documents[0].anchor = 4;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Enter);
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(contents(&editor), b"\n\n    value");
+        assert_eq!(editor_document(&editor).insertion_points, [6]);
+        assert_eq!(
+            buffer_line_and_column(&editor_document(&editor).buffer, 6),
+            (2, 4)
+        );
+    }
+
+    #[test]
     fn bracket_space_inserts_blank_lines_without_moving_selection() {
         let mut editor = editor_with_text("one\ntwo");
         editor.documents[0].cursor = 4;
@@ -6204,6 +11051,28 @@ mod tests {
             (4, 8)
         );
         assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn match_surround_adds_and_replaces_paired_delimiters() {
+        let mut editor = editor_with_text("item");
+        editor.documents[0].anchor = 0;
+        editor.documents[0].cursor = 3;
+        for key in ['m', 's', '{'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(contents(&editor), b"{item}");
+        assert_eq!(
+            (
+                editor_document(&editor).anchor,
+                editor_document(&editor).cursor
+            ),
+            (1, 4)
+        );
+        for key in ['m', 'r', '{', '['] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(contents(&editor), b"[item]");
     }
 
     #[test]
@@ -6337,7 +11206,403 @@ mod tests {
     }
 
     #[test]
-    fn explicit_type_member_completion_accepts_with_tab() {
+    fn goto_definition_prefers_a_mutable_local_inside_field_access() {
+        let source = "fn open() {\n    let mut document = document_empty();\n    code_index_step(\n        &document.buffer,\n        &mut document.code_index,\n    );\n}";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("editor.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("editor.rs")),
+        );
+        let use_position = source.find("&document.buffer").unwrap() + 1;
+        editor.documents[0].cursor = use_position;
+        editor.documents[0].anchor = use_position;
+        editor_goto_definition(&mut editor);
+        assert_eq!(
+            editor_document(&editor).cursor,
+            source.find("document =").unwrap()
+        );
+    }
+
+    #[test]
+    fn goto_definition_resolves_the_real_editor_step_project_search_call() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/editor.rs");
+        let source = std::fs::read(&path).unwrap();
+        let needle = b"| editor_step_project_search(editor)";
+        let usage = source
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap()
+            + 2;
+        let declaration_needle = b"fn editor_step_project_search";
+        let declaration = source
+            .windows(declaration_needle.len())
+            .position(|window| window == declaration_needle)
+            .unwrap()
+            + 3;
+        let mut editor = editor_open(Some(path)).unwrap();
+        editor.documents[0].cursor = usage;
+        editor.documents[0].anchor = usage;
+        let document = &mut editor.documents[0];
+        while !document.code_index.complete {
+            code_index_step(
+                &document.buffer,
+                &mut document.code_index,
+                usize::MAX,
+                std::time::Duration::MAX,
+            );
+        }
+        let identifier = code_index_identifier_at(&document.code_index, usage).unwrap();
+        assert!(
+            code_index_definition_for(&document.buffer, &document.code_index, identifier).is_some()
+        );
+        editor_goto_definition(&mut editor);
+        assert_eq!(
+            editor_document(&editor).cursor,
+            declaration,
+            "status: {}",
+            editor.status
+        );
+    }
+
+    #[test]
+    fn goto_definition_resolves_same_file_type_in_the_real_editor_run_signature() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/editor.rs");
+        let source = std::fs::read(&path).unwrap();
+        let usage_needle = b"pub fn editor_run(editor: &mut Editor";
+        let usage = source
+            .windows(usage_needle.len())
+            .position(|window| window == usage_needle)
+            .unwrap()
+            + usage_needle.len()
+            - b"Editor".len();
+        let declaration_needle = b"pub struct Editor {";
+        let declaration = source
+            .windows(declaration_needle.len())
+            .position(|window| window == declaration_needle)
+            .unwrap()
+            + b"pub struct ".len();
+        let mut editor = editor_open(Some(path)).unwrap();
+        editor.documents[0].cursor = usage;
+        editor.documents[0].anchor = usage;
+        editor_goto_definition(&mut editor);
+        assert_eq!(
+            editor_document(&editor).cursor,
+            declaration,
+            "status: {}",
+            editor.status
+        );
+    }
+
+    #[test]
+    fn qualified_names_match_symbols_within_their_module_or_crate_subtree() {
+        assert!(rust_path_module_matches(
+            std::path::Path::new("library/std/src/io/error.rs"),
+            b"io"
+        ));
+        assert!(rust_path_module_matches(
+            std::path::Path::new("workspace/bitfield/src/lib.rs"),
+            b"bitfield"
+        ));
+        assert!(!rust_path_module_matches(
+            std::path::Path::new("workspace/other/src/lib.rs"),
+            b"bitfield"
+        ));
+    }
+
+    #[test]
+    fn primitive_types_use_canonical_standard_library_document_symbols() {
+        assert_eq!(
+            rust_primitive_document_symbol(b"bool"),
+            Some(b"prim_bool".as_slice())
+        );
+        assert_eq!(
+            rust_primitive_document_symbol(b"usize"),
+            Some(b"prim_usize".as_slice())
+        );
+        assert_eq!(rust_primitive_document_symbol(b"Potato"), None);
+    }
+
+    #[test]
+    fn type_alias_targets_follow_qualified_paths_and_default_generics() {
+        let source = b"type Flag<T = usize> = core::primitive::bool;";
+        let buffer = buffer_from_bytes(source);
+        let mut owner = Vec::new();
+        let mut name = Vec::new();
+        assert!(rust_type_alias_target(
+            &buffer,
+            b"type Flag".len(),
+            &mut owner,
+            &mut name,
+        ));
+        assert_eq!(owner, b"primitive");
+        assert_eq!(name, b"bool");
+    }
+
+    #[test]
+    fn glob_imports_retain_the_enum_owner_for_unqualified_variants() {
+        let source = b"use ItemData::*;\nmatch item { ScarfPiece(_) => {} }";
+        let buffer = buffer_from_bytes(source);
+        let mut owners = Vec::new();
+        rust_glob_import_owners(&buffer, source.len(), &mut owners);
+        assert!(rust_owner_imported_by_glob(&owners, b"ItemData"));
+        assert!(!rust_owner_imported_by_glob(&owners, b"OtherData"));
+    }
+
+    #[test]
+    fn use_tree_items_retain_their_imported_module_namespace() {
+        let source = b"use crate::code_index::{\n    CodeIndex, code_index_step,\n};\nfn run(index: CodeIndex) { code_index_step(index); }";
+        let buffer = buffer_from_bytes(source);
+        let mut index = code_index_empty();
+        code_index_set_path(&mut index, Some(std::path::Path::new("editor.rs")));
+        while !index.complete {
+            code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        }
+        for name in [b"CodeIndex".as_slice(), b"code_index_step"] {
+            for position in source
+                .windows(name.len())
+                .enumerate()
+                .filter_map(|(position, word)| (word == name).then_some(position))
+            {
+                let identifier = code_index_identifier_at(&index, position).unwrap();
+                let mut owner = Vec::new();
+                rust_import_owner(&buffer, &index, identifier, &mut owner);
+                assert_eq!(owner, b"code_index");
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_std_module_and_item_resolve_with_the_same_namespace_model() {
+        let corpus = RustMethodCorpus {
+            bytes: b"stdioResult".to_vec(),
+            methods: Vec::new(),
+            symbols: vec![
+                crate::rust_methods::RustSymbol {
+                    owner_start: 0,
+                    owner_end: 0,
+                    name_start: 0,
+                    name_end: 3,
+                    path: 0,
+                    position: 0,
+                    end: 3,
+                    detail_start: 0,
+                    detail_end: 0,
+                },
+                crate::rust_methods::RustSymbol {
+                    owner_start: 3,
+                    owner_end: 3,
+                    name_start: 3,
+                    name_end: 5,
+                    path: 0,
+                    position: 10,
+                    end: 12,
+                    detail_start: 0,
+                    detail_end: 0,
+                },
+                crate::rust_methods::RustSymbol {
+                    owner_start: 5,
+                    owner_end: 5,
+                    name_start: 5,
+                    name_end: 11,
+                    path: 1,
+                    position: 20,
+                    end: 26,
+                    detail_start: 0,
+                    detail_end: 0,
+                },
+            ],
+            paths: vec![
+                std::path::PathBuf::from("/tool/library/std/src/lib.rs"),
+                std::path::PathBuf::from("/tool/library/std/src/io/mod.rs"),
+            ],
+            standard_library_available: true,
+        };
+        assert_eq!(rust_indexed_symbol(&corpus, b"std", &[], b"io"), Some(1));
+        assert_eq!(rust_indexed_symbol(&corpus, b"io", &[], b"Result"), Some(2));
+    }
+
+    #[test]
+    fn prelude_vec_never_resolves_to_an_unrelated_dependency_type() {
+        let symbol = |path| crate::rust_methods::RustSymbol {
+            owner_start: 0,
+            owner_end: 0,
+            name_start: 0,
+            name_end: 3,
+            path,
+            position: 10,
+            end: 13,
+            detail_start: 0,
+            detail_end: 0,
+        };
+        let corpus = RustMethodCorpus {
+            bytes: b"Vec".to_vec(),
+            methods: Vec::new(),
+            symbols: vec![symbol(0), symbol(1)],
+            paths: vec![
+                std::path::PathBuf::from("/toolchain/library/alloc/src/vec/mod.rs"),
+                std::path::PathBuf::from("/registry/bumpalo/src/collections/vec.rs"),
+            ],
+            standard_library_available: true,
+        };
+        assert_eq!(rust_indexed_symbol(&corpus, &[], &[], b"Vec"), Some(0));
+    }
+
+    #[test]
+    fn imported_function_definition_uses_the_retained_workspace_declaration() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-imported-definition-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let main = directory.join("main.rs");
+        let helper = directory.join("helper.rs");
+        let other = directory.join("other.rs");
+        let source = "use crate::helper::{target};\nfn main() { target(); }\n";
+        std::fs::write(&main, source).unwrap();
+        std::fs::write(&helper, "pub fn target() {}\n").unwrap();
+        std::fs::write(&other, "pub fn target() {}\n").unwrap();
+        let mut editor = editor_open(Some(main)).unwrap();
+        let usage = source.rfind("target").unwrap();
+        editor.documents[0].anchor = usage;
+        editor.documents[0].cursor = usage;
+
+        editor_goto_definition(&mut editor);
+
+        assert_eq!(
+            editor_document(&editor).path.as_deref(),
+            Some(helper.as_path())
+        );
+        assert_eq!(editor_document(&editor).cursor, 7);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn field_references_do_not_bind_same_named_function_locals() {
+        let source = "struct IgnoreRule { pub pattern: usize }\nfn unrelated(pattern: usize) { consume(pattern); }\nfn apply(rule: IgnoreRule) { consume(rule.pattern); }";
+        let mut editor = editor_with_text(source);
+        editor.project_search = None;
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        let field = source.find("pattern").unwrap();
+        editor.documents[0].cursor = field;
+        editor.documents[0].anchor = field;
+        for key in ['g', 'r'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor.picker.as_ref().unwrap().reference_targets.len(), 2);
+    }
+
+    #[test]
+    fn field_references_infer_sort_closure_parameters_from_vec_element_type() {
+        let source = "struct Diagnostic { pub severity: usize }\nstruct DiagnosticsResult { diagnostics: Vec<Diagnostic> }\nfn collect() { let mut diagnostics = Vec::new(); diagnostics.sort_unstable_by(|left, right| { left.severity.cmp(&right.severity) }); }";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("diagnostics.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("diagnostics.rs")),
+        );
+        let field = source.find("severity").unwrap();
+        editor.documents[0].cursor = field;
+        editor.documents[0].anchor = field;
+        editor_select_references(&mut editor);
+        assert_eq!(
+            editor
+                .picker
+                .as_ref()
+                .map(|picker| picker.reference_targets.len()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn real_diagnostic_severity_field_finds_sort_closure_references() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/diagnostics.rs");
+        let source = std::fs::read(&path).unwrap();
+        let field = source
+            .windows(b"pub severity".len())
+            .position(|window| window == b"pub severity")
+            .unwrap()
+            + 4;
+        let mut editor = editor_open(Some(path)).unwrap();
+        editor.documents[0].cursor = field;
+        editor.documents[0].anchor = field;
+        editor_select_references(&mut editor);
+        let local_references = editor
+            .picker
+            .as_ref()
+            .unwrap()
+            .reference_targets
+            .iter()
+            .filter(|target| target.project_file == u32::MAX)
+            .count();
+        assert!(
+            local_references >= 3,
+            "found {local_references} local references"
+        );
+    }
+
+    #[test]
+    fn reference_picker_excludes_comment_and_string_mentions() {
+        let source = "let value = 1; // value\nlet text = \"value\";\nvalue";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        editor.documents[0].cursor = 4;
+        editor.documents[0].anchor = 4;
+        for key in ['g', 'r'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor.picker.as_ref().unwrap().reference_targets.len(), 2);
+        assert!(!rust_line_position_is_code(b"// value", 3));
+        assert!(!rust_line_position_is_code(b"\"value\"", 2));
+        assert!(rust_line_position_is_code(b"value: &'a str", 0));
+    }
+
+    #[test]
+    fn local_reference_picker_keeps_only_the_same_lexical_binding() {
+        let source =
+            "fn one(size: usize) { use_value(size); }\nfn two(size: usize) { use_value(size); }";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        let first_parameter = source.find("size").unwrap();
+        editor.documents[0].cursor = first_parameter;
+        editor.documents[0].anchor = first_parameter;
+
+        for key in ['g', 'r'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+
+        assert_eq!(editor.picker.as_ref().unwrap().reference_targets.len(), 2);
+    }
+
+    #[test]
+    fn retained_rust_occurrences_exclude_comments_and_strings() {
+        let source = b"fn run() { run(); /* run */ let text = \"run\"; }\n// run\nrun();";
+        let mut identifiers = Vec::new();
+        rust_source_identifiers(source, &mut identifiers);
+        let run_positions: Vec<_> = identifiers
+            .iter()
+            .filter(|range| &source[range.start as usize..range.end as usize] == b"run")
+            .collect();
+        assert_eq!(run_positions.len(), 3);
+    }
+
+    #[test]
+    fn explicit_type_member_completion_accepts_with_enter() {
         let mut editor = editor_with_text("let potato: Vec<usize>; potato.p");
         editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
         editor
@@ -6357,6 +11622,8 @@ mod tests {
                 path: 0,
                 position: 0,
                 end: 0,
+                detail_start: 0,
+                detail_end: 0,
             });
         let end = buffer_len(&editor.documents[0].buffer);
         editor.documents[0].cursor = end;
@@ -6371,7 +11638,392 @@ mod tests {
             Some(1)
         );
         editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(contents(&editor), b"let potato: Vec<usize>; potato.pu");
+        editor_handle_key(&mut editor, Key::Enter);
         assert_eq!(contents(&editor), b"let potato: Vec<usize>; potato.push");
+    }
+
+    #[test]
+    fn qualified_enum_completion_previews_top_variant_and_typing_accepts_it() {
+        let mut editor = editor_with_text("editor::Mode::");
+        editor.documents[0].path = Some(std::path::PathBuf::from("editor.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .bytes
+            .extend_from_slice(b"ModeModeInsertModeOther");
+        editor
+            .rust_methods
+            .corpus
+            .paths
+            .push(std::path::PathBuf::from("editor.rs"));
+        editor.rust_methods.corpus.symbols.extend([
+            crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: 4,
+                path: 0,
+                position: 0,
+                end: 4,
+                detail_start: 0,
+                detail_end: 0,
+            },
+            crate::rust_methods::RustSymbol {
+                owner_start: 4,
+                owner_end: 8,
+                name_start: 8,
+                name_end: 14,
+                path: 0,
+                position: 10,
+                end: 16,
+                detail_start: 0,
+                detail_end: 0,
+            },
+            crate::rust_methods::RustSymbol {
+                owner_start: 14,
+                owner_end: 18,
+                name_start: 18,
+                name_end: 23,
+                path: 0,
+                position: 20,
+                end: 25,
+                detail_start: 0,
+                detail_end: 0,
+            },
+        ]);
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].cursor = end;
+        editor.documents[0].anchor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_refresh_completion(&mut editor);
+        let completion = editor.completion.as_ref().unwrap();
+        assert_eq!(completion_name(completion, completion.matches[0]), "Insert");
+        assert_eq!(completion.selected, 0);
+        assert!(!completion.preview);
+        editor_handle_key(&mut editor, Key::Tab);
+        let completion = editor.completion.as_ref().unwrap();
+        assert_eq!(completion.selected, 0);
+        assert!(completion.preview);
+        editor_handle_key(&mut editor, Key::Character(':'));
+        assert_eq!(contents(&editor), b"editor::Mode::Insert:");
+    }
+
+    #[test]
+    fn typed_receiver_completes_a_matching_free_function_as_a_method() {
+        let mut editor = editor_with_text("let mut editor: Editor; editor.ru");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        let name = b"editor_run";
+        let detail = b"pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal)";
+        editor.rust_methods.corpus.bytes.extend_from_slice(name);
+        editor.rust_methods.corpus.bytes.extend_from_slice(detail);
+        editor
+            .rust_methods
+            .corpus
+            .paths
+            .push(std::path::PathBuf::from("editor.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .symbols
+            .push(crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: name.len() as u32,
+                path: 0,
+                position: 0,
+                end: name.len() as u32,
+                detail_start: name.len() as u32,
+                detail_end: (name.len() + detail.len()) as u32,
+            });
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].cursor = end;
+        editor.documents[0].anchor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('n'));
+        let completion = editor.completion.as_ref().unwrap();
+        let entry = completion
+            .matches
+            .iter()
+            .copied()
+            .find(|&entry| completion_name(completion, entry) == "editor_run")
+            .unwrap();
+        assert_eq!(
+            completion_insertion(completion, entry),
+            b"editor_run(&mut editor, &mut terminal)"
+        );
+    }
+
+    #[test]
+    fn space_a_fills_an_empty_qualified_struct_literal() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-fill-fields-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let definition_path = directory.join("editor.rs");
+        let definition_source =
+            "pub struct Editor {\n    pub documents: Vec<usize>,\n    current: usize,\n}\n";
+        std::fs::write(&definition_path, definition_source).unwrap();
+        let mut editor = editor_with_text("let a = editor::Editor {\n};");
+        let main_path = directory.join("main.rs");
+        editor.documents[0].path = Some(main_path.clone());
+        code_index_set_path(&mut editor.documents[0].code_index, Some(&main_path));
+        editor
+            .rust_methods
+            .corpus
+            .bytes
+            .extend_from_slice(b"Editor");
+        editor.rust_methods.corpus.paths.push(definition_path);
+        editor
+            .rust_methods
+            .corpus
+            .symbols
+            .push(crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: 6,
+                path: 0,
+                position: 11,
+                end: 17,
+                detail_start: 0,
+                detail_end: 0,
+            });
+        editor.documents[0].cursor = "let a = editor::Editor {".len();
+        editor.documents[0].anchor = editor.documents[0].cursor;
+        for key in [' ', 'a'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            contents(&editor),
+            b"let a = editor::Editor {\n    documents: todo!(),\n    current: todo!(),\n};"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn local_name_completion_retains_parameters_and_does_not_move_the_cursor() {
+        let mut editor = editor_with_text("fn example(argument: usize) { argu");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].cursor = end;
+        editor.documents[0].anchor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('m'));
+        let cursor = editor.documents[0].insertion_points[0];
+        assert!(editor.completion.as_ref().is_some_and(|completion| {
+            completion
+                .matches
+                .iter()
+                .any(|&entry| completion_name(completion, entry) == "argument")
+        }));
+        editor_handle_key(&mut editor, Key::Down);
+        editor_handle_key(&mut editor, Key::Up);
+        editor_handle_key(&mut editor, Key::Tab);
+        editor_handle_key(&mut editor, Key::BackTab);
+        assert_eq!(editor.documents[0].insertion_points, [cursor]);
+    }
+
+    #[test]
+    fn callable_completion_builds_borrowed_arguments_and_selects_the_first() {
+        let temp = idno_std::mem().scratch().temp();
+        let mut insertion = temp.vec(64);
+        let selection = rust_callable_insertion(
+            "editor_run",
+            "pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal)",
+            Some("editor"),
+            false,
+            &mut insertion,
+        );
+        assert_eq!(insertion, b"editor_run(&mut editor, &mut terminal)");
+        assert_eq!(
+            &insertion[selection.start as usize..selection.end as usize],
+            b"&mut editor"
+        );
+    }
+
+    #[test]
+    fn postfix_dbg_tab_rewrites_the_expression() {
+        let mut editor = editor_with_text("it.dbg");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].anchor = end;
+        editor.documents[0].cursor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Character('!'));
+        assert_eq!(
+            editor
+                .completion
+                .as_ref()
+                .map(|completion| completion.matches.len()),
+            Some(1)
+        );
+        editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(contents(&editor), b"dbg!(it)");
+        assert!(editor.completion.is_none());
+    }
+
+    #[test]
+    fn argument_motions_select_adjacent_call_arguments() {
+        let source = "call(one, two, three)";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].anchor = source.find("one").unwrap();
+        editor.documents[0].cursor = editor.documents[0].anchor;
+        for key in [']', 'a'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            &source.as_bytes()[editor_document(&editor).anchor..=editor_document(&editor).cursor],
+            b"two"
+        );
+        for key in ['[', 'a'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            &source.as_bytes()[editor_document(&editor).anchor..=editor_document(&editor).cursor],
+            b"one"
+        );
+    }
+
+    #[test]
+    fn filtered_global_completion_uses_the_compact_match_index() {
+        let mut editor = editor_with_text("fn main() {\n}");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .bytes
+            .extend_from_slice(b"zexternal");
+        editor.rust_methods.corpus.symbols.extend_from_slice(&[
+            crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: 1,
+                path: 0,
+                position: 0,
+                end: 1,
+                detail_start: 0,
+                detail_end: 0,
+            },
+            crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 1,
+                name_end: 9,
+                path: 0,
+                position: 0,
+                end: 8,
+                detail_start: 0,
+                detail_end: 0,
+            },
+        ]);
+
+        editor_handle_key(&mut editor, Key::Character('o'));
+        editor_handle_key(&mut editor, Key::Character('e'));
+
+        assert!(editor.completion.as_ref().is_some_and(|completion| {
+            completion
+                .matches
+                .iter()
+                .any(|&entry| completion_name(completion, entry) == "external")
+        }));
+    }
+
+    #[test]
+    fn control_c_toggles_every_line_touched_by_the_selection() {
+        let source = "    one\n  two\nthree\n";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        editor.documents[0].anchor = source.find("one").unwrap();
+        editor.documents[0].cursor = source.find("three").unwrap() + 2;
+
+        editor_handle_key(&mut editor, Key::Control(3));
+        assert_eq!(contents(&editor), b"    // one\n  // two\n// three\n");
+
+        editor_handle_key(&mut editor, Key::Control(3));
+        assert_eq!(contents(&editor), source.as_bytes());
+    }
+
+    #[test]
+    fn insert_tab_uses_configured_spaces_and_keeps_a_collapsed_selection() {
+        let mut editor = editor_with_text("");
+        editor.config.indentation_spaces = 3;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(contents(&editor), b"   ");
+        assert_eq!(editor_document(&editor).insertion_points, [3]);
+        assert_eq!(editor_document(&editor).anchor, 3);
+        assert_eq!(editor_document(&editor).cursor, 3);
+    }
+
+    #[test]
+    fn collapsed_insert_selection_never_paints_a_newline_cell() {
+        let buffer = buffer_from_bytes(b"\n");
+        let selections = [SelectionState {
+            anchor: 0,
+            cursor: 0,
+        }];
+        assert!(!position_is_visibly_selected(
+            &buffer,
+            &selections,
+            0,
+            Mode::Insert,
+        ));
+        assert!(position_is_visibly_selected(
+            &buffer,
+            &selections,
+            0,
+            Mode::Normal,
+        ));
+    }
+
+    #[test]
+    fn tab_and_backtab_navigate_picker_results_in_both_directions() {
+        let mut editor = editor_with_text("");
+        editor.terminal_height = 12;
+        editor.project.paths = std::sync::Arc::new(vec![
+            std::path::PathBuf::from("a"),
+            std::path::PathBuf::from("b"),
+            std::path::PathBuf::from("c"),
+        ]);
+        editor.project.labels = std::sync::Arc::new(vec!["a".into(), "b".into(), "c".into()]);
+        editor_open_picker(&mut editor, PickerKind::Files);
+        editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 1);
+        editor_handle_key(&mut editor, Key::BackTab);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 0);
+        editor_handle_key(&mut editor, Key::BackTab);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn picker_viewport_only_moves_when_selection_crosses_an_edge() {
+        let mut editor = editor_with_text("");
+        editor.terminal_height = 12;
+        editor.project.paths = std::sync::Arc::new(
+            (0..10)
+                .map(|item| std::path::PathBuf::from(format!("{item}.rs")))
+                .collect(),
+        );
+        editor.project.labels =
+            std::sync::Arc::new((0..10).map(|item| format!("{item}.rs")).collect());
+        editor_open_picker(&mut editor, PickerKind::Files);
+        for _ in 0..7 {
+            editor_handle_key(&mut editor, Key::Down);
+        }
+        assert_eq!(editor.picker.as_ref().unwrap().first_visible, 2);
+        editor_handle_key(&mut editor, Key::Up);
+        assert_eq!(editor.picker.as_ref().unwrap().first_visible, 2);
     }
 
     #[test]
@@ -6392,6 +12044,133 @@ mod tests {
             ),
             (3, 7)
         );
+    }
+
+    #[test]
+    fn workspace_symbol_picker_builds_a_syntax_highlighted_location_preview() {
+        let mut editor = editor_with_text("");
+        let path = std::path::PathBuf::from("main.rs");
+        editor.project.paths = std::sync::Arc::new(vec![path.clone()]);
+        editor.project.labels = std::sync::Arc::new(vec!["main.rs".into()]);
+        let source = b"pub fn target() { let value = \"text\"; }";
+        editor.project_search = Some(SearchCorpus {
+            bytes: source.to_vec(),
+            lines: vec![SearchLine {
+                project_file: 0,
+                file_offset: 0,
+                text_start: 0,
+                display_start: 0,
+                display_end: source.len() as u32,
+            }],
+            identifiers: Vec::new(),
+            symbols: Vec::new(),
+        });
+        editor
+            .rust_methods
+            .corpus
+            .bytes
+            .extend_from_slice(b"target");
+        editor.rust_methods.corpus.paths.push(path);
+        editor
+            .rust_methods
+            .corpus
+            .symbols
+            .push(crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: 6,
+                path: 0,
+                position: 7,
+                end: 13,
+                detail_start: 0,
+                detail_end: 0,
+            });
+        editor_open_picker(&mut editor, PickerKind::WorkspaceSymbols);
+        let preview = editor.picker.as_ref().unwrap().preview.as_ref().unwrap();
+        assert_eq!(preview.syntax.language, crate::syntax::SyntaxLanguage::Rust);
+        assert!(!syntax_highlighting_spans(&preview.syntax).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_picker_and_jump_use_the_exact_unicode_source_span() {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "bed-diagnostic-preview-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("main.rs");
+        let source = "fn main() {\n    let café = wrong;\n}\n";
+        std::fs::write(&path, source).unwrap();
+        let mut editor = editor_open(Some(path.clone())).unwrap();
+        editor.project.paths = std::sync::Arc::new(vec![path.clone()]);
+        editor.project.labels = std::sync::Arc::new(vec![String::from("main.rs")]);
+        editor.project_search = Some(project_search_index(
+            &editor.project.paths,
+            &editor.project.labels,
+        ));
+        editor
+            .diagnostics
+            .published
+            .push(crate::diagnostics::Diagnostic {
+                path: path.clone(),
+                display: String::from("error main.rs:2:16 unknown value"),
+                message_start: 19,
+                line: 1,
+                column: 15,
+                end_line: 1,
+                end_column: 20,
+                severity: DiagnosticSeverity::Error,
+            });
+        editor_open_picker(&mut editor, PickerKind::DocumentDiagnostics);
+        let picker = editor.picker.as_ref().unwrap();
+        let item = picker_item_at(&editor, picker, 0).unwrap();
+        let range = picker_preview_target_range(&editor, picker, item).unwrap();
+        let expected = source.find("wrong").unwrap();
+        assert_eq!(range, (expected, expected + "wrong".len()));
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!(preview.target_line, 1);
+        assert_eq!(
+            (preview.target_start, preview.target_end),
+            (expected, expected + "wrong".len())
+        );
+        editor.picker = None;
+        editor_goto_diagnostic(&mut editor, 0);
+        assert_eq!(editor_document(&editor).cursor, expected);
+        assert_eq!(
+            editor_document(&editor).anchor,
+            expected + "wrong".len() - 1
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_picker_builds_preview_with_the_selected_files_syntax() {
+        let mut editor = editor_with_text("");
+        editor.project.paths = std::sync::Arc::new(vec![std::path::PathBuf::from("source.rs")]);
+        editor.project.labels = std::sync::Arc::new(vec!["source.rs".into()]);
+        let source = b"pub fn preview() { let text = \"highlighted\"; }";
+        editor.project_search = Some(SearchCorpus {
+            bytes: source.to_vec(),
+            lines: vec![SearchLine {
+                project_file: 0,
+                file_offset: 0,
+                text_start: 0,
+                display_start: 0,
+                display_end: source.len() as u32,
+            }],
+            identifiers: Vec::new(),
+            symbols: Vec::new(),
+        });
+
+        editor_open_picker(&mut editor, PickerKind::Files);
+
+        let preview = editor.picker.as_ref().unwrap().preview.as_ref().unwrap();
+        assert_eq!(preview.syntax.language, crate::syntax::SyntaxLanguage::Rust);
+        assert!(!syntax_highlighting_spans(&preview.syntax).is_empty());
     }
 
     #[test]
@@ -6435,6 +12214,25 @@ mod tests {
         editor_handle_key(&mut editor, Key::Character('t'));
         editor_handle_key(&mut editor, Key::Character('b'));
         assert_eq!(THEMES[editor.theme].name, "bogster");
+    }
+
+    #[test]
+    fn command_tab_only_moves_selection_until_space_commits_the_command() {
+        let mut editor = editor_with_text("");
+        editor_open_picker(&mut editor, PickerKind::Commands);
+        let initial_query = editor.picker.as_ref().unwrap().query.clone();
+        editor_handle_key(&mut editor, Key::Tab);
+        assert_eq!(editor.picker.as_ref().unwrap().query, initial_query);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 1);
+        editor_handle_key(&mut editor, Key::BackTab);
+        assert_eq!(editor.picker.as_ref().unwrap().query, initial_query);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 0);
+
+        for character in "theme".chars() {
+            editor_handle_key(&mut editor, Key::Character(character));
+        }
+        editor_handle_key(&mut editor, Key::Character(' '));
+        assert_eq!(editor.picker.as_ref().unwrap().query, "theme ");
     }
 
     #[test]
@@ -6578,6 +12376,8 @@ mod tests {
         let mut corpus = SearchCorpus {
             bytes: Vec::new(),
             lines: Vec::new(),
+            identifiers: Vec::new(),
+            symbols: Vec::new(),
         };
         for item in 0..5000 {
             let start = corpus.bytes.len();
@@ -6623,6 +12423,7 @@ mod tests {
         let path = directory.join("main.rs");
         std::fs::write(&path, b"before\nline needle here\nafter\n").unwrap();
         let mut editor = editor_open(Some(path)).unwrap();
+        editor.viewport_height = 1;
         editor_handle_key(&mut editor, Key::Character(' '));
         editor_handle_key(&mut editor, Key::Character('/'));
         for character in "needle".chars() {
@@ -6636,6 +12437,7 @@ mod tests {
             ),
             (7, 23)
         );
+        assert_eq!(editor_document(&editor).top_line, 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

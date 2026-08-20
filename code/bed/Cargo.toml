@@ -10,3 +10,6 @@ libc = "0.2"
 mimalloc.workspace = true
 micropool.workspace = true
 profiling.workspace = true
+
+[dev-dependencies]
+idno_std = { workspace = true, features = ["many-test-threads"] }

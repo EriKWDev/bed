@@ -12,15 +12,28 @@ pub struct RustMethod {
     pub path: u32,
     pub position: u32,
     pub end: u32,
+    pub detail_start: u32,
+    pub detail_end: u32,
+}
+
+struct RustMethodSource<'a> {
+    owner: &'a [u8],
+    name: &'a [u8],
+    signature: &'a [u8],
+    documentation: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
 pub struct RustSymbol {
+    pub owner_start: u32,
+    pub owner_end: u32,
     pub name_start: u32,
     pub name_end: u32,
     pub path: u32,
     pub position: u32,
     pub end: u32,
+    pub detail_start: u32,
+    pub detail_end: u32,
 }
 
 pub struct RustMethodCorpus {
@@ -62,6 +75,21 @@ pub fn rust_method_index_start(
     index
 }
 
+pub fn rust_method_index_restart(
+    index: &mut RustMethodIndex,
+    root: &std::path::Path,
+    project_paths: std::sync::Arc<Vec<std::path::PathBuf>>,
+) {
+    profiling::function_scope!();
+    if let Some(task) = index.task.take() {
+        task.cancel();
+    }
+    let root = root.to_path_buf();
+    index.task = Some(
+        idno_std::threads().spawn_owned(move || rust_method_corpus_build(&root, &project_paths)),
+    );
+}
+
 pub fn rust_method_index_poll(index: &mut RustMethodIndex) -> bool {
     profiling::function_scope!();
     let complete = index
@@ -84,6 +112,15 @@ pub fn rust_method_index_poll(index: &mut RustMethodIndex) -> bool {
     true
 }
 
+pub fn rust_method_index_finish(index: &mut RustMethodIndex) -> bool {
+    profiling::function_scope!();
+    let Some(task) = index.task.take() else {
+        return false;
+    };
+    index.corpus = task.join();
+    true
+}
+
 pub fn rust_method_index_pending(index: &RustMethodIndex) -> bool {
     index.task.is_some()
 }
@@ -96,11 +133,35 @@ pub fn rust_method_name(corpus: &RustMethodCorpus, method: usize) -> &str {
         .unwrap_or("")
 }
 
+pub fn rust_method_detail(corpus: &RustMethodCorpus, method: usize) -> &str {
+    let Some(method) = corpus.methods.get(method) else {
+        return "";
+    };
+    std::str::from_utf8(&corpus.bytes[method.detail_start as usize..method.detail_end as usize])
+        .unwrap_or("")
+}
+
 pub fn rust_symbol_name(corpus: &RustMethodCorpus, symbol: usize) -> &str {
     let Some(symbol) = corpus.symbols.get(symbol) else {
         return "";
     };
     std::str::from_utf8(&corpus.bytes[symbol.name_start as usize..symbol.name_end as usize])
+        .unwrap_or("")
+}
+
+pub fn rust_symbol_owner(corpus: &RustMethodCorpus, symbol: usize) -> &str {
+    let Some(symbol) = corpus.symbols.get(symbol) else {
+        return "";
+    };
+    std::str::from_utf8(&corpus.bytes[symbol.owner_start as usize..symbol.owner_end as usize])
+        .unwrap_or("")
+}
+
+pub fn rust_symbol_detail(corpus: &RustMethodCorpus, symbol: usize) -> &str {
+    let Some(symbol) = corpus.symbols.get(symbol) else {
+        return "";
+    };
+    std::str::from_utf8(&corpus.bytes[symbol.detail_start as usize..symbol.detail_end as usize])
         .unwrap_or("")
 }
 
@@ -112,6 +173,28 @@ pub fn rust_symbol_path(corpus: &RustMethodCorpus, symbol: usize) -> Option<&std
         .paths
         .get(symbol.path as usize)
         .map(std::path::PathBuf::as_path)
+}
+
+pub fn rust_namespace_root<'a>(
+    corpus: &'a RustMethodCorpus,
+    namespace: &[u8],
+) -> Option<&'a std::path::Path> {
+    profiling::function_scope!();
+    corpus
+        .symbols
+        .iter()
+        .enumerate()
+        .find_map(|(symbol, definition)| {
+            let Some(path) = rust_symbol_path(corpus, symbol) else {
+                return None;
+            };
+            (definition.position == 0
+                && rust_symbol_owner(corpus, symbol).is_empty()
+                && rust_symbol_name(corpus, symbol).as_bytes() == namespace
+                && path.file_name() == Some(std::ffi::OsStr::new("lib.rs")))
+            .then(|| path.parent().and_then(std::path::Path::parent))
+            .flatten()
+        })
 }
 
 pub fn rust_method_path(corpus: &RustMethodCorpus, method: usize) -> Option<&std::path::Path> {
@@ -143,13 +226,9 @@ pub fn rust_method_definition(
         return None;
     }
     let receiver_end = name_start - 1;
-    let mut receiver_start = receiver_end;
-    while receiver_start > 0 && rust_identifier_byte(buffer_byte(buffer, receiver_start - 1)) {
-        receiver_start -= 1;
-    }
     let temp = idno_std::mem().scratch().temp();
     let mut owner = temp.vec(32);
-    if !rust_explicit_type(buffer, receiver_start, receiver_end, &mut owner) {
+    if !rust_receiver_type(buffer, receiver_end, corpus, &mut owner) {
         return None;
     }
     let first = corpus.methods.partition_point(|method| {
@@ -179,14 +258,17 @@ pub fn rust_method_complete(
 ) -> Option<usize> {
     profiling::function_scope!();
     matches.clear();
-    let Some((receiver_start, receiver_end, prefix_start)) =
-        rust_member_expression(buffer, insertion_point)
-    else {
+    let mut prefix_start = insertion_point.min(buffer_len(buffer));
+    while prefix_start > 0 && rust_identifier_byte(buffer_byte(buffer, prefix_start - 1)) {
+        prefix_start -= 1;
+    }
+    if prefix_start == 0 || buffer_byte(buffer, prefix_start - 1) != b'.' {
         return None;
-    };
+    }
+    let receiver_end = prefix_start - 1;
     let temp = idno_std::mem().scratch().temp();
     let mut owner = temp.vec(32);
-    if !rust_explicit_type(buffer, receiver_start, receiver_end, &mut owner) {
+    if !rust_receiver_type(buffer, receiver_end, corpus, &mut owner) {
         return None;
     }
     let first = corpus.methods.partition_point(|method| {
@@ -215,6 +297,322 @@ pub fn rust_method_complete(
     Some(prefix_start)
 }
 
+fn rust_receiver_type(
+    buffer: &GapBuffer,
+    receiver_end: usize,
+    corpus: &RustMethodCorpus,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let mut expression_end = receiver_end;
+    while expression_end > 0 && buffer_byte(buffer, expression_end - 1).is_ascii_whitespace() {
+        expression_end -= 1;
+    }
+    if expression_end == 0 {
+        return false;
+    }
+    if buffer_byte(buffer, expression_end - 1) != b')' {
+        let mut expression_start = expression_end;
+        while expression_start > 0
+            && rust_identifier_byte(buffer_byte(buffer, expression_start - 1))
+        {
+            expression_start -= 1;
+        }
+        if expression_start > 0 && buffer_byte(buffer, expression_start - 1) == b'.' {
+            let mut receiver_start = expression_start - 1;
+            while receiver_start > 0
+                && rust_identifier_byte(buffer_byte(buffer, receiver_start - 1))
+            {
+                receiver_start -= 1;
+            }
+            let temp = idno_std::mem().scratch().temp();
+            let mut receiver_type = temp.vec(32);
+            if receiver_start < expression_start - 1
+                && rust_explicit_type(
+                    buffer,
+                    receiver_start,
+                    expression_start - 1,
+                    &mut receiver_type,
+                )
+                && rust_struct_field_type(
+                    buffer,
+                    &receiver_type,
+                    expression_start,
+                    expression_end,
+                    owner,
+                )
+            {
+                return true;
+            }
+        }
+        return expression_start < expression_end
+            && rust_explicit_type(buffer, expression_start, expression_end, owner);
+    }
+    let mut position = expression_end - 1;
+    let mut depth = 1usize;
+    while position > 0 && depth > 0 {
+        position -= 1;
+        depth += usize::from(buffer_byte(buffer, position) == b')');
+        depth = depth.saturating_sub(usize::from(buffer_byte(buffer, position) == b'('));
+    }
+    if depth != 0 {
+        return false;
+    }
+    let mut name_end = position;
+    while name_end > 0 && buffer_byte(buffer, name_end - 1).is_ascii_whitespace() {
+        name_end -= 1;
+    }
+    let mut name_start = name_end;
+    while name_start > 0 && rust_identifier_byte(buffer_byte(buffer, name_start - 1)) {
+        name_start -= 1;
+    }
+    if name_start == name_end {
+        return false;
+    }
+    let mut module_end = name_start;
+    while module_end > 0 && buffer_byte(buffer, module_end - 1).is_ascii_whitespace() {
+        module_end -= 1;
+    }
+    let mut module_start = module_end;
+    if module_end >= 2
+        && buffer_byte(buffer, module_end - 1) == b':'
+        && buffer_byte(buffer, module_end - 2) == b':'
+    {
+        module_end -= 2;
+        module_start = module_end;
+        while module_start > 0 && rust_identifier_byte(buffer_byte(buffer, module_start - 1)) {
+            module_start -= 1;
+        }
+    }
+    for symbol in 0..corpus.symbols.len() {
+        let definition = corpus.symbols[symbol];
+        let name = &corpus.bytes[definition.name_start as usize..definition.name_end as usize];
+        if name.len() != name_end - name_start
+            || !name
+                .iter()
+                .enumerate()
+                .all(|(offset, &byte)| byte == buffer_byte(buffer, name_start + offset))
+        {
+            continue;
+        }
+        if module_start < module_end {
+            let Some(path) = rust_symbol_path(corpus, symbol) else {
+                continue;
+            };
+            let module_matches = path
+                .file_stem()
+                .map(std::ffi::OsStr::as_encoded_bytes)
+                .is_some_and(|candidate| {
+                    candidate.len() == module_end - module_start
+                        && candidate.iter().enumerate().all(|(offset, &byte)| {
+                            byte == buffer_byte(buffer, module_start + offset)
+                        })
+                });
+            if !module_matches {
+                continue;
+            }
+        }
+        if rust_callable_return_type(rust_symbol_detail(corpus, symbol).as_bytes(), owner) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rust_struct_field_type(
+    buffer: &GapBuffer,
+    structure: &[u8],
+    field_start: usize,
+    field_end: usize,
+    result: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let length = buffer_len(buffer);
+    let mut position = 0usize;
+    while position < length {
+        if !rust_buffer_word_equal(buffer, position, b"struct") {
+            position += 1;
+            continue;
+        }
+        position += b"struct".len();
+        rust_skip_buffer_whitespace(buffer, &mut position);
+        let name_start = position;
+        while position < length && rust_identifier_byte(buffer_byte(buffer, position)) {
+            position += 1;
+        }
+        if position - name_start != structure.len()
+            || !structure
+                .iter()
+                .enumerate()
+                .all(|(offset, &byte)| buffer_byte(buffer, name_start + offset) == byte)
+        {
+            continue;
+        }
+        while position < length && buffer_byte(buffer, position) != b'{' {
+            position += 1;
+        }
+        if position >= length {
+            return false;
+        }
+        position += 1;
+        let mut depth = 1usize;
+        while position < length && depth > 0 {
+            let byte = buffer_byte(buffer, position);
+            if byte == b'{' {
+                depth += 1;
+                position += 1;
+                continue;
+            }
+            if byte == b'}' {
+                depth = depth.saturating_sub(1);
+                position += 1;
+                continue;
+            }
+            if depth != 1 || !rust_identifier_byte(byte) || byte.is_ascii_digit() {
+                position += 1;
+                continue;
+            }
+            let candidate_start = position;
+            while position < length && rust_identifier_byte(buffer_byte(buffer, position)) {
+                position += 1;
+            }
+            let candidate_end = position;
+            rust_skip_buffer_whitespace(buffer, &mut position);
+            if candidate_end - candidate_start != field_end - field_start
+                || !(0..field_end - field_start).all(|offset| {
+                    buffer_byte(buffer, candidate_start + offset)
+                        == buffer_byte(buffer, field_start + offset)
+                })
+                || position >= length
+                || buffer_byte(buffer, position) != b':'
+                || (position + 1 < length && buffer_byte(buffer, position + 1) == b':')
+            {
+                continue;
+            }
+            position += 1;
+            rust_skip_buffer_whitespace(buffer, &mut position);
+            while position < length && matches!(buffer_byte(buffer, position), b'&' | b'\'') {
+                position += 1;
+            }
+            if rust_buffer_word_equal(buffer, position, b"mut") {
+                position += 3;
+                rust_skip_buffer_whitespace(buffer, &mut position);
+            }
+            result.clear();
+            loop {
+                let type_start = position;
+                while position < length && rust_identifier_byte(buffer_byte(buffer, position)) {
+                    position += 1;
+                }
+                if type_start == position {
+                    return false;
+                }
+                result.clear();
+                for byte_position in type_start..position {
+                    result.push(buffer_byte(buffer, byte_position));
+                }
+                if position + 1 >= length
+                    || buffer_byte(buffer, position) != b':'
+                    || buffer_byte(buffer, position + 1) != b':'
+                {
+                    return true;
+                }
+                position += 2;
+            }
+        }
+        return false;
+    }
+    false
+}
+
+fn rust_callable_return_type(detail: &[u8], result: &mut Vec<u8, impl Allocator>) -> bool {
+    result.clear();
+    let mut position = 0usize;
+    while position + 1 < detail.len() {
+        if detail[position] == b'-' && detail[position + 1] == b'>' {
+            position += 2;
+            break;
+        }
+        position += 1;
+    }
+    while position < detail.len() && !rust_identifier_byte(detail[position]) {
+        position += 1;
+    }
+    while position < detail.len() && rust_identifier_byte(detail[position]) {
+        result.push(detail[position]);
+        position += 1;
+    }
+    !result.is_empty()
+}
+
+pub fn rust_free_function_complete(
+    buffer: &GapBuffer,
+    insertion_point: usize,
+    corpus: &RustMethodCorpus,
+    matches: &mut Vec<FuzzyMatch, impl Allocator>,
+) -> Option<(usize, usize, usize)> {
+    profiling::function_scope!();
+    matches.clear();
+    let Some((receiver_start, receiver_end, prefix_start)) =
+        rust_member_expression(buffer, insertion_point)
+    else {
+        return None;
+    };
+    let temp = idno_std::mem().scratch().temp();
+    let mut owner = temp.vec(32);
+    if !rust_explicit_type(buffer, receiver_start, receiver_end, &mut owner) {
+        return None;
+    }
+    let mut labels = temp.vec(64);
+    let mut symbols = temp.vec(64);
+    for symbol in 0..corpus.symbols.len() {
+        let detail = rust_symbol_detail(corpus, symbol).as_bytes();
+        if !rust_first_parameter_accepts(detail, &owner) {
+            continue;
+        }
+        labels.push(rust_symbol_name(corpus, symbol));
+        symbols.push(symbol);
+    }
+    let mut query = temp.vec(insertion_point - prefix_start);
+    for position in prefix_start..insertion_point {
+        query.push(buffer_byte(buffer, position));
+    }
+    let query = std::str::from_utf8(&query).unwrap_or("");
+    fuzzy_rank(query, &labels, matches);
+    for found in matches.iter_mut() {
+        found.item = symbols[found.item];
+    }
+    matches.truncate(32);
+    Some((prefix_start, receiver_start, receiver_end))
+}
+
+fn rust_first_parameter_accepts(detail: &[u8], owner: &[u8]) -> bool {
+    let Some(open) = detail.iter().position(|&byte| byte == b'(') else {
+        return false;
+    };
+    let end = detail[open + 1..]
+        .iter()
+        .position(|&byte| matches!(byte, b',' | b')'))
+        .map_or(detail.len(), |offset| open + 1 + offset);
+    let Some(colon) = detail[open + 1..end]
+        .iter()
+        .position(|&byte| byte == b':')
+        .map(|offset| open + 1 + offset)
+    else {
+        return false;
+    };
+    let parameter_type = &detail[colon + 1..end];
+    parameter_type
+        .windows(owner.len())
+        .enumerate()
+        .any(|(position, candidate)| {
+            candidate == owner
+                && (position == 0 || !rust_identifier_byte(parameter_type[position - 1]))
+                && (position + owner.len() == parameter_type.len()
+                    || !rust_identifier_byte(parameter_type[position + owner.len()]))
+        })
+}
+
 fn rust_member_expression(
     buffer: &GapBuffer,
     insertion_point: usize,
@@ -234,7 +632,7 @@ fn rust_member_expression(
     (receiver_start < receiver_end).then_some((receiver_start, receiver_end, prefix_start))
 }
 
-fn rust_explicit_type(
+pub fn rust_explicit_type(
     buffer: &GapBuffer,
     receiver_start: usize,
     receiver_end: usize,
@@ -262,7 +660,16 @@ fn rust_explicit_type(
         }
         let mut position = after_name;
         rust_skip_buffer_whitespace(buffer, &mut position);
-        if position >= buffer_len(buffer) || buffer_byte(buffer, position) != b':' {
+        if position >= buffer_len(buffer)
+            || !matches!(buffer_byte(buffer, position), b':' | b'=')
+            || (buffer_byte(buffer, position) == b':'
+                && position + 1 < buffer_len(buffer)
+                && buffer_byte(buffer, position + 1) == b':')
+        {
+            continue;
+        }
+        if buffer_byte(buffer, position) == b'=' && !rust_identifier_is_let_binding(buffer, search)
+        {
             continue;
         }
         position += 1;
@@ -302,6 +709,31 @@ fn rust_explicit_type(
     false
 }
 
+fn rust_identifier_is_let_binding(buffer: &GapBuffer, identifier_start: usize) -> bool {
+    let mut position = identifier_start;
+    while position > 0 && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+        position -= 1;
+    }
+    let mut word_start = position;
+    while word_start > 0 && rust_identifier_byte(buffer_byte(buffer, word_start - 1)) {
+        word_start -= 1;
+    }
+    if word_start == position {
+        return false;
+    }
+    if position - word_start == 3 && rust_buffer_word_equal(buffer, word_start, b"mut") {
+        position = word_start;
+        while position > 0 && buffer_byte(buffer, position - 1).is_ascii_whitespace() {
+            position -= 1;
+        }
+        word_start = position;
+        while word_start > 0 && rust_identifier_byte(buffer_byte(buffer, word_start - 1)) {
+            word_start -= 1;
+        }
+    }
+    position - word_start == 3 && rust_buffer_word_equal(buffer, word_start, b"let")
+}
+
 fn rust_method_corpus_build(
     root: &std::path::Path,
     project_paths: &[std::path::PathBuf],
@@ -329,6 +761,7 @@ fn rust_method_corpus_build(
             rust_index_directory(&library, &mut corpus);
         }
     }
+    rust_index_cargo_dependencies(root, &mut corpus);
     for path in project_paths {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
             continue;
@@ -357,8 +790,11 @@ fn rust_method_corpus_build(
 
 fn rust_index_directory(root: &std::path::Path, corpus: &mut RustMethodCorpus) {
     profiling::function_scope!();
-    let mut directories = vec![root.to_path_buf()];
+    let temp = idno_std::mem().scratch().temp();
+    let mut directories = temp.vec(512);
+    directories.push(root.to_path_buf());
     while let Some(directory) = directories.pop() {
+        rust_index_crate_root(&directory, corpus);
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(_) => continue,
@@ -381,15 +817,174 @@ fn rust_index_directory(root: &std::path::Path, corpus: &mut RustMethodCorpus) {
     }
 }
 
+fn rust_index_cargo_dependencies(root: &std::path::Path, corpus: &mut RustMethodCorpus) {
+    profiling::function_scope!();
+    let metadata = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1"])
+        .current_dir(root)
+        .output();
+    let metadata = match metadata {
+        Ok(metadata) if metadata.status.success() => metadata.stdout,
+        _ => return,
+    };
+    let marker = b"\"manifest_path\":\"";
+    let mut position = 0usize;
+    while position + marker.len() <= metadata.len() {
+        let Some(found) = metadata[position..]
+            .windows(marker.len())
+            .position(|candidate| candidate == marker)
+        else {
+            break;
+        };
+        let start = position + found + marker.len();
+        let Some(length) = metadata[start..].iter().position(|&byte| byte == b'"') else {
+            break;
+        };
+        let path = match std::str::from_utf8(&metadata[start..start + length]) {
+            Ok(path) => std::path::Path::new(path),
+            Err(_) => {
+                position = start + length + 1;
+                continue;
+            }
+        };
+        if let Some(package) = path.parent() {
+            rust_index_crate_root(package, corpus);
+            let source = package.join("src");
+            if source.is_dir() {
+                rust_index_directory(&source, corpus);
+            }
+        }
+        position = start + length + 1;
+    }
+}
+
+fn rust_index_crate_root(directory: &std::path::Path, corpus: &mut RustMethodCorpus) {
+    let manifest = match std::fs::read(directory.join("Cargo.toml")) {
+        Ok(manifest) => manifest,
+        Err(_) => return,
+    };
+    let Some(name) = rust_manifest_package_name(&manifest) else {
+        return;
+    };
+    let path = directory.join("src/lib.rs");
+    let source = match std::fs::read(&path) {
+        Ok(source) => source,
+        Err(_) => return,
+    };
+    rust_index_source(&path, &source, corpus);
+    let Some(path_index) = corpus.paths.iter().position(|candidate| candidate == &path) else {
+        return;
+    };
+    let temp = idno_std::mem().scratch().temp();
+    let mut rust_name = temp.vec(name.len());
+    rust_name.extend(
+        name.iter()
+            .map(|&byte| if byte == b'-' { b'_' } else { byte }),
+    );
+    rust_symbol_push(
+        corpus,
+        &[],
+        &rust_name,
+        &[],
+        path_index as u32,
+        0,
+        source.len(),
+    );
+}
+
+fn rust_manifest_package_name(manifest: &[u8]) -> Option<&[u8]> {
+    let mut in_package = false;
+    for line in manifest.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut position = 0usize;
+        while position < line.len() && line[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if line.get(position) == Some(&b'[') {
+            in_package = line.get(position..position + 9) == Some(b"[package]");
+            continue;
+        }
+        if !in_package || line.get(position..position + 4) != Some(b"name") {
+            continue;
+        }
+        position += 4;
+        rust_skip_source_whitespace(line, &mut position);
+        if line.get(position) != Some(&b'=') {
+            continue;
+        }
+        position += 1;
+        rust_skip_source_whitespace(line, &mut position);
+        if line.get(position) != Some(&b'"') {
+            continue;
+        }
+        position += 1;
+        let start = position;
+        while position < line.len() && line[position] != b'"' {
+            position += 1;
+        }
+        return (position > start).then_some(&line[start..position]);
+    }
+    None
+}
+
 fn rust_index_source(path: &std::path::Path, source: &[u8], corpus: &mut RustMethodCorpus) {
     profiling::function_scope!();
     if corpus.paths.len() > u32::MAX as usize || source.len() > u32::MAX as usize {
+        return;
+    }
+    if corpus.paths.iter().any(|candidate| candidate == path) {
         return;
     }
     let path_index = corpus.paths.len() as u32;
     corpus.paths.push(path.to_path_buf());
     rust_index_symbols(source, path_index, corpus);
     rust_index_methods(source, path_index, corpus);
+    rust_index_primitive_macro_methods(path, source, path_index, corpus);
+}
+
+fn rust_index_primitive_macro_methods(
+    path: &std::path::Path,
+    source: &[u8],
+    path_index: u32,
+    corpus: &mut RustMethodCorpus,
+) {
+    profiling::function_scope!();
+    let owners: &[&[u8]] = match path.file_name().and_then(std::ffi::OsStr::to_str) {
+        Some("uint_macros.rs") => &[b"u8", b"u16", b"u32", b"u64", b"u128", b"usize"],
+        Some("int_macros.rs") => &[b"i8", b"i16", b"i32", b"i64", b"i128", b"isize"],
+        _ => return,
+    };
+    let mut line_start = 0usize;
+    while line_start < source.len() {
+        let line_end = source[line_start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(source.len(), |offset| line_start + offset);
+        let line = &source[line_start..line_end];
+        let Some((name_start, name_end)) = rust_symbol_line_name(line) else {
+            line_start = line_end.saturating_add(1);
+            continue;
+        };
+        if rust_find_word(&line[..name_start], 0, b"fn").is_none() {
+            line_start = line_end.saturating_add(1);
+            continue;
+        }
+        for &owner in owners {
+            rust_method_push(
+                corpus,
+                RustMethodSource {
+                    owner,
+                    name: &line[name_start..name_end],
+                    signature: line,
+                    documentation: &[],
+                },
+                path_index,
+                line_start + name_start,
+                line_start + name_end,
+            );
+        }
+        line_start = line_end.saturating_add(1);
+    }
 }
 
 fn rust_index_methods(source: &[u8], path: u32, corpus: &mut RustMethodCorpus) {
@@ -428,10 +1023,21 @@ fn rust_index_methods(source: &[u8], path: u32, corpus: &mut RustMethodCorpus) {
                     name_end += 1;
                 }
                 if name_end > name_start {
+                    let detail_start = rust_method_detail_start(source, body);
+                    let mut detail_end = name_end;
+                    while detail_end < source.len()
+                        && !matches!(source[detail_end], b'{' | b';' | b'\n')
+                    {
+                        detail_end += 1;
+                    }
                     rust_method_push(
                         corpus,
-                        &source[owner_start..owner_end],
-                        &source[name_start..name_end],
+                        RustMethodSource {
+                            owner: &source[owner_start..owner_end],
+                            name: &source[name_start..name_end],
+                            signature: &source[body..detail_end],
+                            documentation: &source[detail_start..body],
+                        },
                         path,
                         name_start,
                         name_end,
@@ -443,6 +1049,34 @@ fn rust_index_methods(source: &[u8], path: u32, corpus: &mut RustMethodCorpus) {
             body += 1;
         }
         position = body;
+    }
+}
+
+fn rust_method_detail_start(source: &[u8], function_start: usize) -> usize {
+    let mut start = function_start;
+    while start > 0 && source[start - 1] != b'\n' {
+        start -= 1;
+    }
+    loop {
+        if start == 0 {
+            return start;
+        }
+        let previous_end = start - 1;
+        let mut previous_start = previous_end;
+        while previous_start > 0 && source[previous_start - 1] != b'\n' {
+            previous_start -= 1;
+        }
+        let mut text = previous_start;
+        while text < previous_end && source[text].is_ascii_whitespace() {
+            text += 1;
+        }
+        if source.get(text..text + 3) != Some(b"///")
+            && source.get(text..text + 3) != Some(b"//!")
+            && source.get(text..text + 6) != Some(b"#[doc ")
+        {
+            return start;
+        }
+        start = previous_start;
     }
 }
 
@@ -490,19 +1124,25 @@ fn rust_impl_owner(header: &[u8]) -> Option<(usize, usize)> {
 
 fn rust_method_push(
     corpus: &mut RustMethodCorpus,
-    owner: &[u8],
-    name: &[u8],
+    source: RustMethodSource<'_>,
     path: u32,
     position: usize,
     end: usize,
 ) {
     let owner_start = corpus.bytes.len();
-    corpus.bytes.extend_from_slice(owner);
+    corpus.bytes.extend_from_slice(source.owner);
     let owner_end = corpus.bytes.len();
     let name_start = corpus.bytes.len();
-    corpus.bytes.extend_from_slice(name);
+    corpus.bytes.extend_from_slice(source.name);
     let name_end = corpus.bytes.len();
-    if name_end > u32::MAX as usize {
+    let detail_start = corpus.bytes.len();
+    corpus.bytes.extend_from_slice(source.signature);
+    if !source.documentation.is_empty() {
+        corpus.bytes.push(b'\n');
+        corpus.bytes.extend_from_slice(source.documentation);
+    }
+    let detail_end = corpus.bytes.len();
+    if detail_end > u32::MAX as usize {
         corpus.bytes.truncate(owner_start);
         return;
     }
@@ -514,6 +1154,8 @@ fn rust_method_push(
         path,
         position: position as u32,
         end: end as u32,
+        detail_start: detail_start as u32,
+        detail_end: detail_end as u32,
     });
 }
 
@@ -525,26 +1167,261 @@ fn rust_index_symbols(source: &[u8], path: u32, corpus: &mut RustMethodCorpus) {
             .iter()
             .position(|&byte| byte == b'\n')
             .map_or(source.len(), |offset| line_start + offset);
-        if let Some((name_start, name_end)) = rust_symbol_line_name(&source[line_start..line_end]) {
+        let line = &source[line_start..line_end];
+        let symbol = rust_symbol_line_name(line).or_else(|| rust_symbol_line_generated_type(line));
+        if let Some((name_start, name_end)) = symbol {
             let name = &source[line_start + name_start..line_start + name_end];
-            let stored_start = corpus.bytes.len();
-            corpus.bytes.extend_from_slice(name);
-            let stored_end = corpus.bytes.len();
-            if stored_end <= u32::MAX as usize {
-                corpus.symbols.push(RustSymbol {
-                    name_start: stored_start as u32,
-                    name_end: stored_end as u32,
-                    path,
-                    position: (line_start + name_start) as u32,
-                    end: (line_start + name_end) as u32,
-                });
-            } else {
-                corpus.bytes.truncate(stored_start);
-                return;
+            let declaration_start = line_start
+                + line
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .unwrap_or(name_start);
+            let declaration_end = rust_declaration_detail_end(source, declaration_start);
+            let documentation_start = rust_method_detail_start(source, declaration_start);
+            let temp = idno_std::mem().scratch().temp();
+            let mut detail = temp.vec(declaration_end - documentation_start + 1);
+            detail.extend_from_slice(&source[declaration_start..declaration_end]);
+            if documentation_start < declaration_start {
+                detail.push(b'\n');
+                detail.extend_from_slice(&source[documentation_start..declaration_start]);
+            }
+            rust_symbol_push(
+                corpus,
+                &[],
+                name,
+                &detail,
+                path,
+                line_start + name_start,
+                line_start + name_end,
+            );
+            if rust_line_item_is_enum(&source[line_start..line_end], name_start) {
+                rust_index_enum_variants(source, line_start + name_end, name, path, corpus);
             }
         }
         line_start = line_end.saturating_add(1);
     }
+}
+
+fn rust_symbol_line_generated_type(line: &[u8]) -> Option<(usize, usize)> {
+    let mut position = 0usize;
+    rust_skip_source_whitespace(line, &mut position);
+    let first_start = position;
+    while position < line.len() && rust_identifier_byte(line[position]) {
+        position += 1;
+    }
+    if position == first_start || !line[first_start].is_ascii_lowercase() {
+        return None;
+    }
+    rust_skip_source_whitespace(line, &mut position);
+    let name_start = position;
+    while position < line.len() && rust_identifier_byte(line[position]) {
+        position += 1;
+    }
+    if position == name_start || !line[name_start].is_ascii_uppercase() {
+        return None;
+    }
+    let name_end = position;
+    rust_skip_source_whitespace(line, &mut position);
+    (position == line.len() || line.get(position) == Some(&b',')).then_some((name_start, name_end))
+}
+
+fn rust_symbol_push(
+    corpus: &mut RustMethodCorpus,
+    owner: &[u8],
+    name: &[u8],
+    detail: &[u8],
+    path: u32,
+    position: usize,
+    end: usize,
+) {
+    let stored_start = corpus.bytes.len();
+    corpus.bytes.extend_from_slice(owner);
+    let owner_end = corpus.bytes.len();
+    let name_start = corpus.bytes.len();
+    corpus.bytes.extend_from_slice(name);
+    let name_end = corpus.bytes.len();
+    let detail_start = corpus.bytes.len();
+    corpus.bytes.extend_from_slice(detail);
+    let detail_end = corpus.bytes.len();
+    if detail_end > u32::MAX as usize || position > u32::MAX as usize || end > u32::MAX as usize {
+        corpus.bytes.truncate(stored_start);
+        return;
+    }
+    corpus.symbols.push(RustSymbol {
+        owner_start: stored_start as u32,
+        owner_end: owner_end as u32,
+        name_start: name_start as u32,
+        name_end: name_end as u32,
+        path,
+        position: position as u32,
+        end: end as u32,
+        detail_start: detail_start as u32,
+        detail_end: detail_end as u32,
+    });
+}
+
+fn rust_line_item_is_enum(line: &[u8], name_start: usize) -> bool {
+    let mut position = 0;
+    while position < name_start {
+        if rust_source_word(line, position, b"enum") {
+            return true;
+        }
+        position += 1;
+    }
+    false
+}
+
+fn rust_index_enum_variants(
+    source: &[u8],
+    after_name: usize,
+    owner: &[u8],
+    path: u32,
+    corpus: &mut RustMethodCorpus,
+) {
+    profiling::function_scope!();
+    let Some(relative_open) = source[after_name..].iter().position(|&byte| byte == b'{') else {
+        return;
+    };
+    let mut position = after_name + relative_open + 1;
+    let mut curly_depth = 1usize;
+    let mut round_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut candidate_allowed = true;
+    while position < source.len() && curly_depth > 0 {
+        let byte = source[position];
+        let next = source.get(position + 1).copied();
+        if byte == b'/' && next == Some(b'/') {
+            position += 2;
+            while position < source.len() && source[position] != b'\n' {
+                position += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && next == Some(b'*') {
+            position += 2;
+            while position + 1 < source.len() && source.get(position..position + 2) != Some(b"*/") {
+                position += 1;
+            }
+            position = (position + 2).min(source.len());
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            let delimiter = byte;
+            position += 1;
+            while position < source.len() {
+                if source[position] == b'\\' {
+                    position = (position + 2).min(source.len());
+                } else if source[position] == delimiter {
+                    position += 1;
+                    break;
+                } else {
+                    position += 1;
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'{' => curly_depth += 1,
+            b'}' => curly_depth = curly_depth.saturating_sub(1),
+            b'(' => round_depth += 1,
+            b')' => round_depth = round_depth.saturating_sub(1),
+            b'[' => square_depth += 1,
+            b']' => square_depth = square_depth.saturating_sub(1),
+            b',' if curly_depth == 1 && round_depth == 0 && square_depth == 0 => {
+                candidate_allowed = true;
+            }
+            _ => {}
+        }
+        if curly_depth == 1
+            && round_depth == 0
+            && square_depth == 0
+            && candidate_allowed
+            && byte.is_ascii_uppercase()
+        {
+            let name_start = position;
+            position += 1;
+            while position < source.len() && rust_identifier_byte(source[position]) {
+                position += 1;
+            }
+            let name_end = position;
+            let declaration_start = name_start;
+            let documentation_start = rust_method_detail_start(source, declaration_start);
+            let mut declaration_end = name_end;
+            let mut declaration_round_depth = 0usize;
+            let mut declaration_square_depth = 0usize;
+            let mut declaration_curly_depth = 0usize;
+            while declaration_end < source.len() {
+                match source[declaration_end] {
+                    b'(' => declaration_round_depth += 1,
+                    b')' => declaration_round_depth = declaration_round_depth.saturating_sub(1),
+                    b'[' => declaration_square_depth += 1,
+                    b']' => declaration_square_depth = declaration_square_depth.saturating_sub(1),
+                    b'{' => declaration_curly_depth += 1,
+                    b'}' if declaration_curly_depth > 0 => declaration_curly_depth -= 1,
+                    b',' if declaration_round_depth == 0
+                        && declaration_square_depth == 0
+                        && declaration_curly_depth == 0 =>
+                    {
+                        break;
+                    }
+                    b'\n'
+                        if declaration_round_depth == 0
+                            && declaration_square_depth == 0
+                            && declaration_curly_depth == 0 =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                declaration_end += 1;
+            }
+            while declaration_end > declaration_start
+                && source[declaration_end - 1].is_ascii_whitespace()
+            {
+                declaration_end -= 1;
+            }
+            let temp = idno_std::mem().scratch().temp();
+            let mut detail = temp.vec(declaration_end - documentation_start + 1);
+            detail.extend_from_slice(&source[declaration_start..declaration_end]);
+            if documentation_start < declaration_start {
+                detail.push(b'\n');
+                detail.extend_from_slice(&source[documentation_start..declaration_start]);
+            }
+            rust_symbol_push(
+                corpus,
+                owner,
+                &source[name_start..name_end],
+                &detail,
+                path,
+                name_start,
+                name_end,
+            );
+            candidate_allowed = false;
+            continue;
+        }
+        position += 1;
+    }
+}
+
+fn rust_declaration_detail_end(source: &[u8], start: usize) -> usize {
+    let mut position = start;
+    let mut round_depth = 0usize;
+    let mut square_depth = 0usize;
+    while position < source.len() {
+        match source[position] {
+            b'(' => round_depth += 1,
+            b')' => round_depth = round_depth.saturating_sub(1),
+            b'[' => square_depth += 1,
+            b']' => square_depth = square_depth.saturating_sub(1),
+            b'{' | b';' if round_depth == 0 && square_depth == 0 => break,
+            _ => {}
+        }
+        position += 1;
+    }
+    while position > start && source[position - 1].is_ascii_whitespace() {
+        position -= 1;
+    }
+    position
 }
 
 fn rust_symbol_line_name(line: &[u8]) -> Option<(usize, usize)> {
@@ -570,13 +1447,44 @@ fn rust_symbol_line_name(line: &[u8]) -> Option<(usize, usize)> {
             }
             continue;
         }
+        if word == b"const" {
+            let mut next = position;
+            rust_skip_source_whitespace(line, &mut next);
+            let next_start = next;
+            while next < line.len() && rust_identifier_byte(line[next]) {
+                next += 1;
+            }
+            if matches!(&line[next_start..next], b"unsafe" | b"trait" | b"fn") {
+                rust_skip_source_whitespace(line, &mut position);
+                continue;
+            }
+        }
         if matches!(word, b"async" | b"unsafe" | b"extern" | b"default") {
             rust_skip_source_whitespace(line, &mut position);
             continue;
         }
+        if word == b"macro_rules" {
+            if line.get(position) == Some(&b'!') {
+                position += 1;
+            }
+            rust_skip_source_whitespace(line, &mut position);
+            let name_start = position;
+            while position < line.len() && rust_identifier_byte(line[position]) {
+                position += 1;
+            }
+            return (position > name_start).then_some((name_start, position));
+        }
         if !matches!(
             word,
-            b"fn" | b"struct" | b"enum" | b"trait" | b"type" | b"mod" | b"const" | b"static"
+            b"fn"
+                | b"struct"
+                | b"enum"
+                | b"trait"
+                | b"type"
+                | b"mod"
+                | b"const"
+                | b"static"
+                | b"macro"
         ) {
             return None;
         }
@@ -655,6 +1563,22 @@ mod tests {
     use crate::buffer::buffer_from_bytes;
 
     #[test]
+    fn finishing_an_index_publishes_its_background_corpus() {
+        let mut index = rust_method_index_empty();
+        index.task = Some(idno_std::threads().spawn_owned(|| RustMethodCorpus {
+            bytes: b"Potato".to_vec(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: true,
+        }));
+        assert!(rust_method_index_finish(&mut index));
+        assert!(index.task.is_none());
+        assert_eq!(index.corpus.bytes, b"Potato");
+        assert!(index.corpus.standard_library_available);
+    }
+
+    #[test]
     fn explicit_vec_type_completes_indexed_push_method() {
         let mut corpus = RustMethodCorpus {
             bytes: Vec::new(),
@@ -687,9 +1611,228 @@ mod tests {
         };
         rust_index_source(std::path::Path::new("option.rs"), source, &mut corpus);
         assert_eq!(rust_symbol_name(&corpus, 0), "Option");
+        assert_eq!(rust_symbol_name(&corpus, 1), "None");
+        assert_eq!(rust_symbol_owner(&corpus, 1), "Option");
+        assert_eq!(rust_symbol_name(&corpus, 2), "Some");
+        assert_eq!(rust_symbol_owner(&corpus, 2), "Option");
         let buffer = buffer_from_bytes(b"let value: Option<usize>; value.get_or_insert()");
         let method = rust_method_definition(&buffer, 34, &corpus).unwrap();
         assert_eq!(rust_method_name(&corpus, method), "get_or_insert");
         assert_eq!(corpus.methods[method].position, 64);
+    }
+
+    #[test]
+    fn enum_variants_retain_their_declaration_and_documentation() {
+        let source = b"pub enum Mode {\n    /// `r\"hello\"`\n    RawStr,\n}";
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: false,
+        };
+        rust_index_source(std::path::Path::new("mode.rs"), source, &mut corpus);
+        let symbol = corpus
+            .symbols
+            .iter()
+            .enumerate()
+            .find_map(|(symbol, _)| {
+                (rust_symbol_name(&corpus, symbol) == "RawStr").then_some(symbol)
+            })
+            .unwrap();
+        let detail = rust_symbol_detail(&corpus, symbol);
+        assert!(detail.starts_with("RawStr"));
+        assert!(detail.contains("/// `r\"hello\"`"));
+    }
+
+    #[test]
+    fn top_level_functions_retain_signatures_docs_and_complete_as_free_methods() {
+        let source = b"/// Runs one editor step.\npub fn editor_run(\n    editor: &mut Editor,\n    terminal: &mut Terminal,\n) {}";
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: false,
+        };
+        rust_index_source(std::path::Path::new("editor.rs"), source, &mut corpus);
+        let symbol = corpus
+            .symbols
+            .iter()
+            .enumerate()
+            .find_map(|(symbol, _)| {
+                (rust_symbol_name(&corpus, symbol) == "editor_run").then_some(symbol)
+            })
+            .unwrap();
+        let detail = rust_symbol_detail(&corpus, symbol);
+        assert!(detail.contains("pub fn editor_run"));
+        assert!(detail.contains("Runs one editor step"));
+
+        let buffer = buffer_from_bytes(b"fn caller(editor: &mut Editor) { editor.run");
+        let mut matches = Vec::new();
+        let expression =
+            rust_free_function_complete(&buffer, buffer_len(&buffer), &corpus, &mut matches);
+        assert_eq!(expression, Some((40, 33, 39)));
+        assert_eq!(matches[0].item, symbol);
+    }
+
+    #[test]
+    fn method_definition_propagates_a_qualified_call_return_type() {
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: true,
+        };
+        rust_index_source(
+            std::path::Path::new("library/std/src/env.rs"),
+            b"pub fn temp_dir() -> PathBuf { loop {} }",
+            &mut corpus,
+        );
+        rust_index_source(
+            std::path::Path::new("library/std/src/path.rs"),
+            b"impl PathBuf { pub fn join<P>(&self, path: P) -> PathBuf {} }",
+            &mut corpus,
+        );
+        let source = b"let directory = std::env::temp_dir().join(format!(\"x\"));";
+        let buffer = buffer_from_bytes(source);
+        let cursor = source.windows(4).position(|word| word == b"join").unwrap();
+        let method = rust_method_definition(&buffer, cursor, &corpus).unwrap();
+        assert_eq!(rust_method_name(&corpus, method), "join");
+    }
+
+    #[test]
+    fn indexes_declarative_macro_names() {
+        let source = b"#[macro_export]\nmacro_rules! println { () => {} }\npub macro newer() {}\npub const unsafe trait Allocator {}";
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: false,
+        };
+        rust_index_source(std::path::Path::new("macros.rs"), source, &mut corpus);
+        assert!(
+            corpus
+                .symbols
+                .iter()
+                .enumerate()
+                .any(|(symbol, _)| rust_symbol_name(&corpus, symbol) == "println")
+        );
+        assert!(
+            corpus
+                .symbols
+                .iter()
+                .enumerate()
+                .any(|(symbol, _)| rust_symbol_name(&corpus, symbol) == "Allocator")
+        );
+        assert!(
+            corpus
+                .symbols
+                .iter()
+                .enumerate()
+                .any(|(symbol, _)| rust_symbol_name(&corpus, symbol) == "newer")
+        );
+    }
+
+    #[test]
+    #[ignore = "scans Cargo metadata and the installed Rust source tree"]
+    fn real_corpus_contains_qualified_standard_aliases_and_workspace_macros() {
+        let corpus =
+            rust_method_corpus_build(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
+        let result = corpus.symbols.iter().enumerate().any(|(symbol, _)| {
+            rust_symbol_name(&corpus, symbol) == "Result"
+                && rust_symbol_path(&corpus, symbol).is_some_and(|path| {
+                    path.components()
+                        .any(|component| component.as_os_str() == "io")
+                })
+        });
+        let bitfield = corpus.symbols.iter().enumerate().any(|(symbol, _)| {
+            rust_symbol_name(&corpus, symbol) == "bitfield"
+                && rust_symbol_path(&corpus, symbol).is_some_and(|path| {
+                    path.components()
+                        .any(|component| component.as_os_str() == "bitfield")
+                })
+        });
+        let option = corpus
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(symbol, _)| rust_symbol_name(&corpus, symbol) == "Option");
+        let vec = corpus
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(symbol, _)| rust_symbol_name(&corpus, symbol) == "Vec");
+        let is_some = corpus.methods.iter().enumerate().any(|(method, _)| {
+            rust_method_name(&corpus, method) == "is_some"
+                && corpus.bytes[corpus.methods[method].owner_start as usize
+                    ..corpus.methods[method].owner_end as usize]
+                    == *b"Option"
+        });
+        assert!(result, "std::io::Result was not indexed");
+        assert!(bitfield, "bitfield::bitfield! was not indexed");
+        assert!(option, "prelude Option was not indexed");
+        assert!(vec, "prelude Vec was not indexed");
+        assert!(is_some, "Option::is_some was not indexed");
+
+        let editor_source = include_bytes!("editor.rs");
+        let editor_buffer = buffer_from_bytes(editor_source);
+        let usage = editor_source
+            .windows(b"editor.picker.is_some".len())
+            .position(|window| window == b"editor.picker.is_some")
+            .unwrap()
+            + b"editor.picker.".len();
+        let picker_end = usage - 1;
+        let picker_start = picker_end - b"picker".len();
+        let editor_start = picker_start - b"editor.".len();
+        let editor_end = editor_start + b"editor".len();
+        let mut owner = Vec::new();
+        assert!(rust_explicit_type(
+            &editor_buffer,
+            editor_start,
+            editor_end,
+            &mut owner
+        ));
+        assert_eq!(owner, b"Editor");
+        let receiver_type = owner.clone();
+        assert!(rust_struct_field_type(
+            &editor_buffer,
+            &receiver_type,
+            picker_start,
+            picker_end,
+            &mut owner,
+        ));
+        assert_eq!(owner, b"Option");
+        let method = rust_method_definition(&editor_buffer, usage, &corpus).unwrap();
+        assert_eq!(rust_method_name(&corpus, method), "is_some");
+    }
+
+    #[test]
+    fn indexes_integer_methods_generated_from_standard_library_macro_tables() {
+        let source = b"pub const fn next_multiple_of(self, rhs: Self) -> Self { self }";
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: true,
+        };
+        rust_index_source(
+            std::path::Path::new("core/src/num/uint_macros.rs"),
+            source,
+            &mut corpus,
+        );
+        corpus.methods.sort_unstable_by(|left, right| {
+            let left_owner = &corpus.bytes[left.owner_start as usize..left.owner_end as usize];
+            let right_owner = &corpus.bytes[right.owner_start as usize..right.owner_end as usize];
+            let left_name = &corpus.bytes[left.name_start as usize..left.name_end as usize];
+            let right_name = &corpus.bytes[right.name_start as usize..right.name_end as usize];
+            (left_owner, left_name).cmp(&(right_owner, right_name))
+        });
+        let buffer = buffer_from_bytes(b"let size: usize = 7; size.next_multiple_of(4)");
+        let method = rust_method_definition(&buffer, 32, &corpus).unwrap();
+        assert_eq!(rust_method_name(&corpus, method), "next_multiple_of");
     }
 }

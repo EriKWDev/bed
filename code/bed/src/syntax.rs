@@ -34,8 +34,10 @@ pub enum SyntaxLanguage {
     C,
     Cpp,
     Go,
+    Jai,
     Nim,
     Odin,
+    Shell,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +93,13 @@ pub fn syntax_highlighting_empty() -> SyntaxHighlighting {
 }
 
 pub fn syntax_language_from_path(path: Option<&std::path::Path>) -> SyntaxLanguage {
+    if path
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| matches!(name, ".bashrc" | ".bash_profile" | ".zshrc" | ".zprofile"))
+    {
+        return SyntaxLanguage::Shell;
+    }
     let Some(extension) = path.and_then(std::path::Path::extension) else {
         return SyntaxLanguage::None;
     };
@@ -104,8 +113,10 @@ pub fn syntax_language_from_path(path: Option<&std::path::Path>) -> SyntaxLangua
         "c" | "h" => SyntaxLanguage::C,
         "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => SyntaxLanguage::Cpp,
         "go" => SyntaxLanguage::Go,
+        "jai" => SyntaxLanguage::Jai,
         "nim" | "nims" | "nimble" => SyntaxLanguage::Nim,
         "odin" => SyntaxLanguage::Odin,
+        "sh" | "bash" | "zsh" => SyntaxLanguage::Shell,
         _ => SyntaxLanguage::None,
     }
 }
@@ -328,12 +339,6 @@ fn syntax_scan_code_byte(buffer: &GapBuffer, highlighting: &mut SyntaxHighlighti
         highlighting.line_start = false;
         return;
     }
-    if highlighting.language == SyntaxLanguage::Toml && highlighting.line_start && byte == b'[' {
-        syntax_mode_begin(highlighting, SyntaxMode::MarkupDelimited, position, b']', 1);
-        highlighting.position += 1;
-        highlighting.line_start = false;
-        return;
-    }
     if highlighting.language == SyntaxLanguage::Rust && byte == b'\'' {
         let lifetime_end = syntax_rust_lifetime_end(buffer, position, length);
         if lifetime_end > position {
@@ -385,7 +390,19 @@ fn syntax_scan_code_byte(buffer: &GapBuffer, highlighting: &mut SyntaxHighlighti
     }
     if matches!(
         byte,
-        b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'!' | b'&' | b'|' | b'^' | b'<' | b'>'
+        b'+' | b'-'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'='
+            | b'!'
+            | b'&'
+            | b'|'
+            | b'^'
+            | b'<'
+            | b'>'
+            | b'$'
+            | b'~'
     ) {
         syntax_span_push(highlighting, position, position + 1, SyntaxKind::Operator);
     } else if matches!(
@@ -435,16 +452,25 @@ fn syntax_scan_number_byte(
 ) {
     if highlighting.position < length {
         let byte = buffer_byte(buffer, highlighting.position);
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'_' | b'.' | b'+' | b'-')
+            || (highlighting.language == SyntaxLanguage::Toml && byte == b':')
+        {
             highlighting.position += 1;
             return;
         }
     }
+    let kind = syntax_number_kind(
+        buffer,
+        highlighting.language,
+        highlighting.token_start,
+        highlighting.position,
+    );
     syntax_span_push(
         highlighting,
         highlighting.token_start,
         highlighting.position,
-        SyntaxKind::Number,
+        kind,
     );
     highlighting.mode = SyntaxMode::Code;
 }
@@ -563,11 +589,18 @@ fn syntax_scan_string_byte(buffer: &GapBuffer, highlighting: &mut SyntaxHighligh
             );
         if closes {
             highlighting.position += highlighting.delimiter_length as usize;
+            let kind = syntax_toml_string_key_kind(
+                buffer,
+                highlighting.language,
+                highlighting.token_start,
+                highlighting.position,
+            )
+            .unwrap_or(SyntaxKind::String);
             syntax_span_push(
                 highlighting,
                 highlighting.token_start,
                 highlighting.position,
-                SyntaxKind::String,
+                kind,
             );
             highlighting.mode = SyntaxMode::Code;
             highlighting.escaped = false;
@@ -652,12 +685,15 @@ fn syntax_highlighting_finish(
                 syntax_span_push(highlighting, highlighting.token_start, length, kind);
             }
         }
-        SyntaxMode::Number => syntax_span_push(
-            highlighting,
-            highlighting.token_start,
-            length,
-            SyntaxKind::Number,
-        ),
+        SyntaxMode::Number => {
+            let kind = syntax_number_kind(
+                buffer,
+                highlighting.language,
+                highlighting.token_start,
+                length,
+            );
+            syntax_span_push(highlighting, highlighting.token_start, length, kind);
+        }
         SyntaxMode::LineComment | SyntaxMode::BlockComment => {
             syntax_comment_spans_push(buffer, highlighting, highlighting.token_start, length)
         }
@@ -848,6 +884,7 @@ fn syntax_declaration_keyword(
         b"const",
         b"enum",
         b"fn",
+        b"function",
         b"func",
         b"interface",
         b"let",
@@ -878,6 +915,74 @@ fn syntax_previous_word_is(buffer: &GapBuffer, start: usize, expected: &[u8]) ->
     syntax_range_equal(buffer, previous_start, end, expected)
 }
 
+fn syntax_number_kind(
+    buffer: &GapBuffer,
+    language: SyntaxLanguage,
+    start: usize,
+    end: usize,
+) -> SyntaxKind {
+    if language == SyntaxLanguage::Toml
+        && (start..end)
+            .any(|position| matches!(buffer_byte(buffer, position), b'-' | b':' | b'T' | b'Z'))
+    {
+        SyntaxKind::String
+    } else {
+        SyntaxKind::Number
+    }
+}
+
+fn syntax_toml_bare_key_kind(
+    buffer: &GapBuffer,
+    start: usize,
+    end: usize,
+    length: usize,
+) -> Option<SyntaxKind> {
+    syntax_toml_key_kind(buffer, start, end, length)
+}
+
+fn syntax_toml_string_key_kind(
+    buffer: &GapBuffer,
+    language: SyntaxLanguage,
+    start: usize,
+    end: usize,
+) -> Option<SyntaxKind> {
+    if language != SyntaxLanguage::Toml {
+        return None;
+    }
+    syntax_toml_key_kind(buffer, start, end, buffer_len(buffer))
+}
+
+fn syntax_toml_key_kind(
+    buffer: &GapBuffer,
+    start: usize,
+    end: usize,
+    length: usize,
+) -> Option<SyntaxKind> {
+    let mut line_start = start;
+    while line_start > 0 && buffer_byte(buffer, line_start - 1) != b'\n' {
+        line_start -= 1;
+    }
+    let mut first = line_start;
+    while first < length && matches!(buffer_byte(buffer, first), b' ' | b'\t') {
+        first += 1;
+    }
+    if first < start && buffer_byte(buffer, first) == b'[' {
+        return Some(SyntaxKind::Type);
+    }
+    if (line_start..start).any(|position| buffer_byte(buffer, position) == b'=') {
+        return None;
+    }
+    let mut position = end;
+    while position < length {
+        match buffer_byte(buffer, position) {
+            b'=' => return Some(SyntaxKind::Attribute),
+            b'\n' | b'#' => return None,
+            _ => position += 1,
+        }
+    }
+    None
+}
+
 fn syntax_identifier_kind(
     buffer: &GapBuffer,
     language: SyntaxLanguage,
@@ -885,6 +990,16 @@ fn syntax_identifier_kind(
     end: usize,
     length: usize,
 ) -> Option<SyntaxKind> {
+    if language == SyntaxLanguage::Toml {
+        if syntax_range_equal(buffer, start, end, b"true")
+            || syntax_range_equal(buffer, start, end, b"false")
+        {
+            return Some(SyntaxKind::Constant);
+        }
+        if let Some(kind) = syntax_toml_bare_key_kind(buffer, start, end, length) {
+            return Some(kind);
+        }
+    }
     if syntax_control_keyword(buffer, language, start, end) {
         return Some(SyntaxKind::Control);
     }
@@ -893,11 +1008,6 @@ fn syntax_identifier_kind(
     }
     if syntax_keyword(buffer, language, start, end) {
         return Some(SyntaxKind::Keyword);
-    }
-    if matches!(language, SyntaxLanguage::Toml)
-        && syntax_next_nonwhitespace(buffer, end, length) == Some(b'=')
-    {
-        return Some(SyntaxKind::Attribute);
     }
     if syntax_previous_word_is(buffer, start, b"fn")
         || syntax_previous_word_is(buffer, start, b"func")
@@ -1066,6 +1176,27 @@ fn syntax_keyword(buffer: &GapBuffer, language: SyntaxLanguage, start: usize, en
             b"type",
             b"var",
         ],
+        SyntaxLanguage::Jai => &[
+            b"break",
+            b"case",
+            b"cast",
+            b"continue",
+            b"defer",
+            b"else",
+            b"enum",
+            b"for",
+            b"if",
+            b"inline",
+            b"no_inline",
+            b"null",
+            b"return",
+            b"struct",
+            b"switch",
+            b"true",
+            b"false",
+            b"union",
+            b"while",
+        ],
         SyntaxLanguage::Nim => &[
             b"and",
             b"as",
@@ -1162,6 +1293,44 @@ fn syntax_keyword(buffer: &GapBuffer, language: SyntaxLanguage, start: usize, en
             b"where",
         ],
         SyntaxLanguage::Toml => &[b"false", b"true"],
+        SyntaxLanguage::Shell => &[
+            b"alias",
+            b"bg",
+            b"builtin",
+            b"cd",
+            b"command",
+            b"dirs",
+            b"disown",
+            b"echo",
+            b"eval",
+            b"exec",
+            b"export",
+            b"false",
+            b"fg",
+            b"getopts",
+            b"hash",
+            b"jobs",
+            b"local",
+            b"popd",
+            b"printf",
+            b"pushd",
+            b"pwd",
+            b"read",
+            b"readonly",
+            b"set",
+            b"shift",
+            b"source",
+            b"test",
+            b"times",
+            b"trap",
+            b"true",
+            b"typeset",
+            b"ulimit",
+            b"umask",
+            b"unalias",
+            b"unset",
+            b"wait",
+        ],
         SyntaxLanguage::None | SyntaxLanguage::Markdown => &[],
     };
     keywords
@@ -1171,11 +1340,14 @@ fn syntax_keyword(buffer: &GapBuffer, language: SyntaxLanguage, start: usize, en
 
 fn syntax_starts_line_comment(language: SyntaxLanguage, byte: u8, next: Option<u8>) -> bool {
     match language {
-        SyntaxLanguage::Toml | SyntaxLanguage::Nim => byte == b'#' && next != Some(b'['),
+        SyntaxLanguage::Toml | SyntaxLanguage::Nim | SyntaxLanguage::Shell => {
+            byte == b'#' && next != Some(b'[')
+        }
         SyntaxLanguage::Rust
         | SyntaxLanguage::C
         | SyntaxLanguage::Cpp
         | SyntaxLanguage::Go
+        | SyntaxLanguage::Jai
         | SyntaxLanguage::Odin => byte == b'/' && next == Some(b'/'),
         SyntaxLanguage::None | SyntaxLanguage::Markdown => false,
     }
@@ -1188,18 +1360,24 @@ fn syntax_starts_block_comment(language: SyntaxLanguage, byte: u8, next: Option<
         | SyntaxLanguage::C
         | SyntaxLanguage::Cpp
         | SyntaxLanguage::Go
+        | SyntaxLanguage::Jai
         | SyntaxLanguage::Odin => byte == b'/' && next == Some(b'*'),
-        SyntaxLanguage::None | SyntaxLanguage::Toml | SyntaxLanguage::Markdown => false,
+        SyntaxLanguage::None
+        | SyntaxLanguage::Toml
+        | SyntaxLanguage::Markdown
+        | SyntaxLanguage::Shell => false,
     }
 }
 
 fn syntax_starts_string(language: SyntaxLanguage, byte: u8) -> bool {
     match language {
-        SyntaxLanguage::Go => matches!(byte, b'\'' | b'"' | b'`'),
+        SyntaxLanguage::Go | SyntaxLanguage::Shell => matches!(byte, b'\'' | b'"' | b'`'),
         SyntaxLanguage::Toml | SyntaxLanguage::Nim => matches!(byte, b'\'' | b'"'),
-        SyntaxLanguage::Rust | SyntaxLanguage::C | SyntaxLanguage::Cpp | SyntaxLanguage::Odin => {
-            matches!(byte, b'\'' | b'"')
-        }
+        SyntaxLanguage::Rust
+        | SyntaxLanguage::C
+        | SyntaxLanguage::Cpp
+        | SyntaxLanguage::Jai
+        | SyntaxLanguage::Odin => matches!(byte, b'\'' | b'"'),
         SyntaxLanguage::None | SyntaxLanguage::Markdown => false,
     }
 }
@@ -1214,6 +1392,7 @@ fn syntax_starts_attribute(
         || (matches!(language, SyntaxLanguage::C | SyntaxLanguage::Cpp)
             && line_start
             && byte == b'#')
+        || (language == SyntaxLanguage::Jai && byte == b'#')
         || (language == SyntaxLanguage::Odin && byte == b'@')
 }
 
@@ -1298,12 +1477,50 @@ mod tests {
             SyntaxLanguage::Go
         );
         assert_eq!(
+            syntax_language_from_path(Some(std::path::Path::new("a.jai"))),
+            SyntaxLanguage::Jai
+        );
+        assert_eq!(
             syntax_language_from_path(Some(std::path::Path::new("a.nim"))),
             SyntaxLanguage::Nim
         );
         assert_eq!(
             syntax_language_from_path(Some(std::path::Path::new("a.odin"))),
             SyntaxLanguage::Odin
+        );
+        assert_eq!(
+            syntax_language_from_path(Some(std::path::Path::new(".zshrc"))),
+            SyntaxLanguage::Shell
+        );
+        assert_eq!(
+            syntax_language_from_path(Some(std::path::Path::new("build.sh"))),
+            SyntaxLanguage::Shell
+        );
+    }
+
+    #[test]
+    fn shell_scanner_highlights_control_strings_variables_and_comments() {
+        let highlighting = highlight(
+            ".zshrc",
+            "if [[ -n \"$HOME\" ]]; then\n  export PATH=\"$HOME/bin:$PATH\" # tools\nfi",
+        );
+        assert!(
+            highlighting
+                .spans
+                .iter()
+                .any(|span| span.kind == SyntaxKind::Control)
+        );
+        assert!(
+            highlighting
+                .spans
+                .iter()
+                .any(|span| span.kind == SyntaxKind::String)
+        );
+        assert!(
+            highlighting
+                .spans
+                .iter()
+                .any(|span| span.kind == SyntaxKind::Comment)
         );
     }
 
@@ -1424,22 +1641,23 @@ mod tests {
 
     #[test]
     fn toml_and_markdown_have_structural_highlights() {
-        let toml = highlight("bed.toml", "[editor]\ntheme = \"kanagawa\" # color\n");
-        assert!(
-            toml.spans
-                .iter()
-                .any(|span| span.kind == SyntaxKind::Markup)
+        let toml = highlight(
+            "bed.toml",
+            "[editor.display]\ntheme = \"kanagawa\"\nenabled = true\nwhen = 1979-05-27T07:32:00Z # color\n",
         );
-        assert!(
-            toml.spans
-                .iter()
-                .any(|span| span.kind == SyntaxKind::Attribute)
-        );
-        assert!(
-            toml.spans
-                .iter()
-                .any(|span| span.kind == SyntaxKind::String)
-        );
+        for kind in [
+            SyntaxKind::Type,
+            SyntaxKind::Punctuation,
+            SyntaxKind::Attribute,
+            SyntaxKind::Constant,
+            SyntaxKind::String,
+            SyntaxKind::Comment,
+        ] {
+            assert!(
+                toml.spans.iter().any(|span| span.kind == kind),
+                "missing TOML {kind:?}"
+            );
+        }
 
         let markdown = highlight("README.md", "# Heading\n`code` and [link](target)\n");
         assert!(

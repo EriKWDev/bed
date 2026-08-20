@@ -14,8 +14,8 @@ Current bindings:
 |---|---|
 | normal | `h/j/k/l`, Helix-category `w/b`, or arrows move selections; `x` selects/extends whole lines; `d` deletes; `y` yanks and `p`/`P` paste after/before; `i/a/I/A/o` enter insert; `v` extends selections; `[Space`/`]Space` insert a blank line without moving |
 | select | movement extends the selection, `d` deletes it, `v` or Escape returns to normal |
-| insert | text inserts, Backspace/Delete edit, arrows move, Escape returns to normal |
-| objects | `ma<char>` selects around a matching pair; `mi<char>` selects inside it; `maf`/`mif` select the outermost enclosing function; all remain normal-mode motions |
+| insert | text inserts, configured-space Tab indents, Backspace/Delete edit, arrows move, Escape returns to normal |
+| objects | `ma<char>` selects around a matching pair; `mi<char>` selects inside it; `ms<char>` surrounds selections; `mr<old><new>` replaces surrounds; `maf`/`mif` select the outermost enclosing function; all remain normal-mode motions |
 | multiple cursors | `C` adds a cursor on the line below; movement and editing affect every selection |
 | search | `/` performs contiguous smart-case search in the current buffer from the cursor forward with wraparound; `s` searches within the current selections and previews one cursor per occurrence; `n`/`N` traverse a committed `/` search |
 | code navigation | in Rust buffers, `gd` selects the nearest definition and `gr` opens a reference picker; `[f`/`]f` select functions, `[g`/`]g` visit Git changes, and `[d`/`]d` visit diagnostics |
@@ -28,8 +28,9 @@ with its available keys and descriptions. This currently covers `Space`,
 `Space t`, `g`, `m`, `ma`, and `mi`; the panel table is extended alongside new
 prefix bindings so it never advertises unavailable commands. `g<number>g`
 jumps to a one-based line number, while `gg` retains its file-start behavior.
-`Space Y` copies selections to the system clipboard and `Space P` pastes from
-it; both external operations run on the worker pool rather than the input path.
+`Space Y` copies selections to the system clipboard, `Space P` pastes after,
+and `Space R` replaces every selection from it; all external operations run on
+the worker pool rather than the input path.
 
 The command palette completes command names first and switches completion to
 the command's arguments after a space. `:theme ` and `:t ` complete theme
@@ -39,18 +40,23 @@ verbatim. Buffer commands include `:new`/`:n`, `:bc[!]`, `:bco[!]`,
 `:bca[!]`, `:bn`, and `:bp`. The write/quit families include `:wa[!]`,
 `:qa[!]`, and `:wqa[!]`. `:rl[!]` reloads the current buffer and
 `:rla[!]` reloads every file-backed buffer through undoable replacements.
+`:format` runs the current Rust, C/C++, or Go formatter on the worker pool and
+applies an unchanged-buffer result as one undoable edit.
 
 Kanagawa is the default theme. `:theme <name>` selects `kanagawa`, `bogster`,
 `everforest_light`, `noctis`, or `kaolin-valley-dark`. The same set is on
 `Space t d/k/b/l/n/v` respectively. Selection, normal cursor, secondary insert
 cursor, gutter, status line, picker, Git indicators, foreground, and background colors are
 theme-controlled; the primary insert cursor remains a terminal bar with a
-theme-controlled cursor color. During `s`, the original selection is rendered
-as a faint search scope while occurrences use the stronger selection color and
-their cursors use the cursor color.
+theme-controlled cursor color. `/` renders only its currently proposed match;
+`s` renders only the occurrences that will become selections and never paints
+the original selection as a separate scope. `Ctrl-C` toggles the language's
+line-comment marker on every line touched by every selection, preserving each
+line's indentation and committing the whole operation as one undoable edit.
 
 Extension-selected syntax highlighting currently covers TOML, Markdown, Rust,
-C, C++, Go, Nim, and Odin. It uses a resumable byte scanner and retained flat
+C, C++, Go, Nim, Odin, and Bash/Zsh shell files including `.bashrc` and
+`.zshrc`. It uses a resumable byte scanner and retained flat
 span storage: opening a file gets a one-millisecond immediate pass, then any
 remaining work continues in 500-microsecond event-loop slices. Edits clear and
 reuse the span allocation. No parser task, syntax tree, or tree-sitter runtime
@@ -59,26 +65,44 @@ comment annotations (`NOTE`/`HELP` in blue, `WARNING`/`HACK` in orange,
 `FIXME`/`ERROR` in emphatic red, and other uppercase labels), Rust lifetimes,
 ordinary/control/declaration keywords, strings, numbers, types,
 functions, constants, attributes, operators, punctuation, and markup.
+Selection and picker-focus backgrounds compose over those syntax foregrounds.
+TOML further distinguishes table keys, pair keys, booleans, punctuation,
+date/time literals, ordinary numbers, strings, and comments.
 
 Rust buffers also maintain a resumable flat identifier/definition index. It
 ignores comments and strings, prefers the nearest definition visible at the
 identifier's lexical scope, and deliberately accepts incomplete source. This
 also backs document symbol lookup. Workspace symbol lookup includes top-level
-workspace and active-toolchain standard-library symbols. Explicit local types support member completion: for
+workspace, Cargo dependency, and active-toolchain standard-library symbols.
+Crate roots, declarative macros, macro-generated primitive types/methods, const
+traits, and enum variants participate in definition lookup. Module navigation
+first selects the `mod` declaration; invoking `gd` there opens and selects the
+module file. Primitive types resolve to their canonical active-toolchain
+documentation declarations, and invoking `gd` on a selected type alias follows
+its target. A failed explicit definition request synchronously publishes any
+outstanding Rust corpus and project-discovery work before reporting that no
+definition exists. Explicit local types support member completion: for
 example `potato: Vec<usize>` resolves `potato.pu` against a compact method index
 built from workspace Rust sources and the active toolchain's installed
 standard-library sources. Toolchain/sysroot discovery and source reads run on
-the shared worker pool; typing only performs local inference and ranks retained
-method spans. Tab accepts a completion and Ctrl-N/Ctrl-P changes the selected
-candidate. This remains intentionally tolerant inference rather than a compiler
-front end.
+the shared worker pool; typing performs local inference and ranks retained
+method, local/argument, keyword, function, and type spans. Tab/Shift-Tab,
+Up/Down, and Ctrl-P/Ctrl-N cycle candidates without moving the insertion point;
+Enter accepts. The list is anchored beneath the cursor and selected declaration
+details/doc comments use a separate dark panel. This remains intentionally
+tolerant inference rather than a compiler front end.
 `gd` resolves constants, statics, `mod name;` files, top-level workspace
 symbols, standard-library types, and methods on explicitly typed receivers.
 Definitions and picker results select the identifier with the cursor at its
 start. Cross-file navigation records only the origin and final selection, so
 targets are centered and Ctrl-O returns directly to the call site with its
-original viewport position. `gr` shows exact retained workspace
-occurrences in a picker rather than turning them into editing cursors.
+original viewport position. Project indexing retains a flat, name-sorted Rust
+occurrence table, so `gr` binary-selects only same-name candidates rather than
+rescanning every line on every request. An explicit `gr` finishes outstanding
+discovery/index publication before answering. Non-Rust files are excluded;
+locals retain lexical-definition identity, while field candidates require an
+owner-compatible receiver or struct context rather than merely the same
+spelling.
 
 Cargo diagnostics are collected on the worker pool and published as one
 severity-sorted retained snapshot. `Space d`/`Space D` show file/workspace
@@ -106,8 +130,18 @@ searches its existing candidates first, edits reuse already-found candidates,
 and no keystroke spawns a new task. All matches remain accumulated while only
 a small top-ranked window is sorted for display.
 
+Source-backed pickers use a centered box-drawing dialog with a stable scrolling
+result viewport and a split source preview. Preview windows retain one reusable
+gap buffer, immediately run the same extension-selected syntax scanner for a
+bounded slice, and finish remaining highlighting in event-loop budgets.
+Tab/Down move through results and Shift-Tab/Up move backward.
+
 Insert mode auto-pairs `()`, `[]`, `{}`, and double quotes by default. Enter
 between brackets creates an indented interior line and a dedented closing line.
+Repeated Enter removes indentation from the line it leaves, so only the active
+line carries auto-inserted indentation even when existing text is pushed down.
+New lines use the nearest unmatched code delimiter while ignoring delimiters in
+comments and strings; unfinished continuation lines retain their deeper indent.
 Unused automatic indentation is removed on Escape, while the entire insert
 session remains one undo transaction. `:toggle-auto-pairs`,
 `:toggle-auto-indentation`, and `:toggle-auto-indent-scopes` control these

@@ -33,5 +33,5 @@ fn run() -> std::io::Result<()> {
         Err(error) => return Err(error),
     };
 
-    editor::editor_run(&mut editor, &mut terminal)
+    return editor::editor_run(&mut editor, &mut terminal);
 }

@@ -9,6 +9,7 @@ pub enum Key {
     Enter,
     Backspace,
     Tab,
+    BackTab,
     Left,
     Right,
     Up,
@@ -22,7 +23,13 @@ pub struct Terminal {
     pub device: std::fs::File,
     #[cfg(unix)]
     pub original: libc::termios,
+    #[cfg(unix)]
+    previous_panic_hook: Option<SharedPanicHook>,
 }
+
+#[cfg(unix)]
+type SharedPanicHook =
+    std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
 
 pub fn terminal_open() -> std::io::Result<Terminal> {
     #[cfg(unix)]
@@ -47,7 +54,17 @@ pub fn terminal_open() -> std::io::Result<Terminal> {
             return Err(std::io::Error::last_os_error());
         }
 
-        let mut terminal = Terminal { device, original };
+        let previous_panic_hook: SharedPanicHook = std::panic::take_hook().into();
+        let panic_hook = std::sync::Arc::clone(&previous_panic_hook);
+        std::panic::set_hook(Box::new(move |information| {
+            terminal_restore_descriptor(descriptor, &original);
+            panic_hook(information);
+        }));
+        let mut terminal = Terminal {
+            device,
+            original,
+            previous_panic_hook: Some(previous_panic_hook),
+        };
         if let Err(error) = terminal.device.write_all(b"\x1b[?1049h\x1b[?25l") {
             return Err(error);
         }
@@ -254,6 +271,7 @@ fn read_escape_sequence(input: &mut std::fs::File) -> std::io::Result<Key> {
         b'D' => Key::Left,
         b'H' => Key::Home,
         b'F' => Key::End,
+        b'Z' => Key::BackTab,
         b'3' => {
             let _tilde = match read_byte(input) {
                 Ok(tilde) => tilde,
@@ -300,6 +318,25 @@ impl Drop for Terminal {
 
             libc::tcsetattr(self.device.as_raw_fd(), libc::TCSAFLUSH, &self.original);
         }
+        #[cfg(unix)]
+        if !std::thread::panicking()
+            && let Some(previous) = self.previous_panic_hook.take()
+        {
+            std::panic::set_hook(Box::new(move |information| previous(information)));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_restore_descriptor(descriptor: std::os::fd::RawFd, original: &libc::termios) {
+    const RESTORE: &[u8] = b"\x1b[0m\x1b[0 q\x1b[?7h\x1b[?25h\x1b[?1049l";
+    unsafe {
+        libc::write(
+            descriptor,
+            RESTORE.as_ptr().cast::<libc::c_void>(),
+            RESTORE.len(),
+        );
+        libc::tcsetattr(descriptor, libc::TCSAFLUSH, original);
     }
 }
 
