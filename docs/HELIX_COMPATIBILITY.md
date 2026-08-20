@@ -53,7 +53,8 @@ exhaustive inventories.
   acceptance, and identifier-selecting symbol palette acceptance.
 - Preferred-column vertical motion; function objects on `maf`/`mif`; nested
   function traversal on `[f`/`]f`; standard-library symbol/method definitions;
-  atomic cross-file jumps; and undoable `:rl`/`:rla` reload aliases.
+  centered symbol targets, jump-list viewport restoration, atomic cross-file
+  jumps, and undoable `:rl`/`:rla` reload aliases.
 - Nonblocking Cargo diagnostics with severity-ordered document/workspace
   pickers on `Space d`/`Space D` and navigation on `[d`/`]d`.
 

@@ -97,6 +97,33 @@ pub fn buffer_previous_char(buffer: &GapBuffer, position: usize) -> usize {
     previous
 }
 
+pub fn buffer_decode_char(buffer: &GapBuffer, position: usize) -> (char, usize) {
+    let length = buffer_len(buffer);
+    if position >= length {
+        return ('\0', length);
+    }
+    let next = buffer_next_char(buffer, position);
+    let byte_length = next - position;
+    if byte_length == 1 {
+        let byte = buffer_byte(buffer, position);
+        return if byte.is_ascii() {
+            (byte as char, next)
+        } else {
+            ('\u{fffd}', next)
+        };
+    }
+    let mut bytes = [0; 4];
+    let decoded_length = byte_length.min(bytes.len());
+    for (offset, byte) in bytes[..decoded_length].iter_mut().enumerate() {
+        *byte = buffer_byte(buffer, position + offset);
+    }
+    let character = std::str::from_utf8(&bytes[..decoded_length])
+        .ok()
+        .and_then(|text| text.chars().next())
+        .unwrap_or('\u{fffd}');
+    (character, next)
+}
+
 pub fn buffer_next_word_start(buffer: &GapBuffer, position: usize) -> usize {
     let length = buffer_len(buffer);
     let mut position = position.min(length);
@@ -273,6 +300,8 @@ mod tests {
         }
         assert_eq!(positions, [0, 1, 3, 7]);
         assert_eq!(buffer_previous_char(&buffer, 7), 3);
+        assert_eq!(buffer_decode_char(&buffer, 1), ('å', 3));
+        assert_eq!(buffer_decode_char(&buffer, 3), ('🦀', 7));
     }
 
     #[test]

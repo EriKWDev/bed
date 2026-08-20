@@ -76,7 +76,8 @@ front end.
 symbols, standard-library types, and methods on explicitly typed receivers.
 Definitions and picker results select the identifier with the cursor at its
 start. Cross-file navigation records only the origin and final selection, so
-Ctrl-O returns directly to the call site. `gr` shows exact retained workspace
+targets are centered and Ctrl-O returns directly to the call site with its
+original viewport position. `gr` shows exact retained workspace
 occurrences in a picker rather than turning them into editing cursors.
 
 Cargo diagnostics are collected on the worker pool and published as one

@@ -368,6 +368,7 @@ pub struct Jump {
     pub document: usize,
     pub cursor: usize,
     pub anchor: usize,
+    pub top_line: usize,
 }
 
 pub struct Editor {
@@ -2688,6 +2689,7 @@ pub fn editor_location(editor: &Editor) -> Jump {
         document: editor.current,
         cursor: document.cursor,
         anchor: document.anchor,
+        top_line: document.top_line,
     }
 }
 
@@ -2727,6 +2729,8 @@ pub fn editor_jump(editor: &mut Editor, forward: bool) {
     let document = editor_document_mut(editor);
     document.cursor = jump.cursor.min(buffer_len(&document.buffer));
     document.anchor = jump.anchor.min(buffer_len(&document.buffer));
+    document.top_line = jump.top_line;
+    document.preferred_column = buffer_line_and_column(&document.buffer, document.cursor).1;
     editor.mode = Mode::Normal;
 }
 
@@ -4581,6 +4585,7 @@ fn editor_goto_diagnostic(editor: &mut Editor, diagnostic: usize) {
     let start = buffer_position_at_line_column(&editor_document(editor).buffer, line, column);
     let end = buffer_next_char(&editor_document(editor).buffer, start);
     editor_set_symbol_selection(editor, start, end);
+    editor_center_view(editor);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
 }
@@ -4951,6 +4956,7 @@ fn editor_select_symbol(editor: &mut Editor, start: usize, end: usize) {
     profiling::function_scope!();
     let before = editor_location(editor);
     editor_set_symbol_selection(editor, start, end);
+    editor_center_view(editor);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
 }
@@ -4983,8 +4989,17 @@ fn editor_navigate_to_symbol(
     };
     editor_switch_document_state(editor, target);
     editor_set_symbol_selection(editor, start, end);
+    editor_center_view(editor);
     let after = editor_location(editor);
     editor_record_jump(editor, before, after);
+}
+
+fn editor_center_view(editor: &mut Editor) {
+    profiling::function_scope!();
+    let visible_lines = editor.viewport_height.max(1);
+    let document = editor_document_mut(editor);
+    let cursor_line = buffer_line_and_column(&document.buffer, document.cursor).0;
+    document.top_line = cursor_line.saturating_sub(visible_lines / 2);
 }
 
 fn editor_goto_first_nonwhitespace(editor: &mut Editor) {
@@ -5884,6 +5899,41 @@ mod tests {
         assert_eq!(editor_document(&editor).cursor, 24);
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn definition_jumps_center_targets_and_restore_the_original_view() {
+        let mut source = String::new();
+        for _ in 0..40 {
+            source.push('\n');
+        }
+        let definition = source.len() + 6;
+        source.push_str("const TARGET: usize = 1;\n");
+        for _ in 0..39 {
+            source.push('\n');
+        }
+        let usage = source.len();
+        source.push_str("TARGET\n");
+        let mut editor = editor_with_text(&source);
+        editor.viewport_height = 20;
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        editor.documents[0].cursor = usage;
+        editor.documents[0].anchor = usage;
+        editor.documents[0].top_line = 70;
+
+        for key in ['g', 'd'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor_document(&editor).cursor, definition);
+        assert_eq!(editor_document(&editor).top_line, 30);
+
+        editor_handle_key(&mut editor, Key::Control(15));
+        assert_eq!(editor_document(&editor).cursor, usage);
+        assert_eq!(editor_document(&editor).top_line, 70);
     }
 
     #[test]
