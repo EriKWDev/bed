@@ -49,6 +49,13 @@ pub struct RustMethodIndex {
     pub task: Option<idno_std::micropool::OwnedTask<RustMethodCorpus>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustBorrowKind {
+    Owned,
+    Shared,
+    Mutable,
+}
+
 pub fn rust_method_index_empty() -> RustMethodIndex {
     RustMethodIndex {
         corpus: RustMethodCorpus {
@@ -731,7 +738,7 @@ pub fn rust_explicit_type(
     owner: &mut Vec<u8, impl Allocator>,
 ) -> bool {
     profiling::function_scope!();
-    let mut search = receiver_start;
+    let mut search = receiver_start.saturating_add(1).min(buffer_len(buffer));
     while search > 0 {
         search -= 1;
         if !rust_range_equal(
@@ -815,6 +822,142 @@ fn rust_binding_type(
     rust_explicit_type(buffer, receiver_start, receiver_end, owner)
 }
 
+pub fn rust_binding_type_at(
+    buffer: &GapBuffer,
+    identifier_start: usize,
+    identifier_end: usize,
+    corpus: &RustMethodCorpus,
+    result: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    rust_binding_type(buffer, identifier_start, identifier_end, corpus, result)
+}
+
+pub fn rust_call_argument_type(
+    buffer: &GapBuffer,
+    insertion_point: usize,
+    corpus: &RustMethodCorpus,
+    result: &mut Vec<u8, impl Allocator>,
+) -> Option<RustBorrowKind> {
+    profiling::function_scope!();
+    result.clear();
+    let mut position = insertion_point.min(buffer_len(buffer));
+    let mut nested = 0usize;
+    let open = loop {
+        if position == 0 {
+            return None;
+        }
+        position -= 1;
+        match buffer_byte(buffer, position) {
+            b')' | b']' | b'}' => nested += 1,
+            b'(' if nested == 0 => break position,
+            b'(' | b'[' | b'{' => nested = nested.saturating_sub(1),
+            b';' if nested == 0 => return None,
+            _ => {}
+        }
+    };
+    let mut argument = 0usize;
+    nested = 0;
+    for byte_position in open + 1..insertion_point.min(buffer_len(buffer)) {
+        match buffer_byte(buffer, byte_position) {
+            b'(' | b'[' | b'{' | b'<' => nested += 1,
+            b')' | b']' | b'}' | b'>' => nested = nested.saturating_sub(1),
+            b',' if nested == 0 => argument += 1,
+            _ => {}
+        }
+    }
+    let mut name_end = open;
+    while name_end > 0 && buffer_byte(buffer, name_end - 1).is_ascii_whitespace() {
+        name_end -= 1;
+    }
+    let mut name_start = name_end;
+    while name_start > 0 && rust_identifier_byte(buffer_byte(buffer, name_start - 1)) {
+        name_start -= 1;
+    }
+    if name_start == name_end {
+        return None;
+    }
+    for symbol in 0..corpus.symbols.len() {
+        let name = rust_symbol_name(corpus, symbol).as_bytes();
+        if name.len() != name_end - name_start
+            || !name
+                .iter()
+                .enumerate()
+                .all(|(offset, &byte)| byte == buffer_byte(buffer, name_start + offset))
+        {
+            continue;
+        }
+        if let Some(borrow) = rust_signature_argument_type(
+            rust_symbol_detail(corpus, symbol).as_bytes(),
+            argument,
+            result,
+        ) {
+            return Some(borrow);
+        }
+    }
+    None
+}
+
+fn rust_signature_argument_type(
+    signature: &[u8],
+    target_argument: usize,
+    result: &mut Vec<u8, impl Allocator>,
+) -> Option<RustBorrowKind> {
+    let Some(open) = signature.iter().position(|&byte| byte == b'(') else {
+        return None;
+    };
+    let mut position = open + 1;
+    let mut argument = 0usize;
+    let mut nested = 0usize;
+    let mut start = position;
+    while position < signature.len() {
+        let byte = signature[position];
+        if matches!(byte, b'(' | b'[' | b'{' | b'<') {
+            nested += 1;
+        } else if matches!(byte, b']' | b'}' | b'>') {
+            nested = nested.saturating_sub(1);
+        } else if (byte == b')' || byte == b',') && nested == 0 {
+            if argument == target_argument {
+                let end = position;
+                let Some(colon) = signature[start..end]
+                    .iter()
+                    .position(|&candidate| candidate == b':')
+                    .map(|offset| start + offset)
+                else {
+                    return None;
+                };
+                let mut type_position = colon + 1;
+                while type_position < end && signature[type_position].is_ascii_whitespace() {
+                    type_position += 1;
+                }
+                let borrow = if signature.get(type_position..type_position + 5) == Some(b"&mut ") {
+                    type_position += 5;
+                    RustBorrowKind::Mutable
+                } else if signature.get(type_position) == Some(&b'&') {
+                    type_position += 1;
+                    RustBorrowKind::Shared
+                } else {
+                    RustBorrowKind::Owned
+                };
+                while type_position < end && signature[type_position].is_ascii_whitespace() {
+                    type_position += 1;
+                }
+                return rust_type_terminal_identifier(signature, &mut type_position, result)
+                    .then_some(borrow);
+            }
+            if byte == b')' {
+                return None;
+            }
+            argument += 1;
+            start = position + 1;
+        } else if byte == b')' {
+            nested = nested.saturating_sub(1);
+        }
+        position += 1;
+    }
+    None
+}
+
 fn rust_inferred_binding_type(
     buffer: &GapBuffer,
     receiver_start: usize,
@@ -824,7 +967,7 @@ fn rust_inferred_binding_type(
 ) -> bool {
     profiling::function_scope!();
     let name_length = receiver_end.saturating_sub(receiver_start);
-    let mut search = receiver_start;
+    let mut search = receiver_start.saturating_add(1).min(buffer_len(buffer));
     while search > 0 {
         search -= 1;
         if !rust_range_equal(
@@ -983,7 +1126,7 @@ fn rust_method_corpus_build(
             rust_index_directory(&library, &mut corpus);
         }
     }
-    rust_index_cargo_dependencies(root, &mut corpus);
+    rust_index_cargo_dependencies(root, project_paths, &mut corpus);
     for path in project_paths {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
             continue;
@@ -1039,8 +1182,39 @@ fn rust_index_directory(root: &std::path::Path, corpus: &mut RustMethodCorpus) {
     }
 }
 
-fn rust_index_cargo_dependencies(root: &std::path::Path, corpus: &mut RustMethodCorpus) {
+fn rust_index_cargo_dependencies(
+    root: &std::path::Path,
+    project_paths: &[std::path::PathBuf],
+    corpus: &mut RustMethodCorpus,
+) {
     profiling::function_scope!();
+    let mut manifests = Vec::with_capacity(32);
+    let root_manifest = root.join("Cargo.toml");
+    if root_manifest.is_file() {
+        manifests.push(root_manifest);
+    }
+    for path in project_paths {
+        for directory in path.ancestors().skip(1) {
+            let manifest = directory.join("Cargo.toml");
+            if manifest.is_file() {
+                if !manifests.contains(&manifest) {
+                    manifests.push(manifest);
+                }
+                break;
+            }
+            if directory == root {
+                break;
+            }
+        }
+    }
+    let mut direct_dependencies = Vec::with_capacity(64);
+    for manifest in &manifests {
+        let source = match std::fs::read(manifest) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        rust_manifest_dependency_names(&source, &mut direct_dependencies);
+    }
     let metadata = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .current_dir(root)
@@ -1069,6 +1243,24 @@ fn rust_index_cargo_dependencies(root: &std::path::Path, corpus: &mut RustMethod
                 continue;
             }
         };
+        let manifest = match std::fs::read(path) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                position = start + length + 1;
+                continue;
+            }
+        };
+        let Some(package_name) = rust_manifest_package_name(&manifest) else {
+            position = start + length + 1;
+            continue;
+        };
+        if !direct_dependencies
+            .iter()
+            .any(|dependency: &Vec<u8>| dependency.as_slice() == package_name)
+        {
+            position = start + length + 1;
+            continue;
+        }
         if let Some(package) = path.parent() {
             rust_index_crate_root(package, corpus);
             let source = package.join("src");
@@ -1077,6 +1269,69 @@ fn rust_index_cargo_dependencies(root: &std::path::Path, corpus: &mut RustMethod
             }
         }
         position = start + length + 1;
+    }
+}
+
+fn rust_manifest_dependency_names(source: &[u8], result: &mut Vec<Vec<u8>>) {
+    profiling::function_scope!();
+    let mut dependencies = false;
+    for source_line in source.split(|&byte| byte == b'\n') {
+        let line = source_line
+            .split(|&byte| byte == b'#')
+            .next()
+            .unwrap_or(&[])
+            .trim_ascii();
+        if line.starts_with(b"[") {
+            dependencies = matches!(
+                line,
+                b"[dependencies]" | b"[dev-dependencies]" | b"[build-dependencies]"
+            ) || (line.starts_with(b"[target.")
+                && (line.ends_with(b".dependencies]")
+                    || line.ends_with(b".dev-dependencies]")
+                    || line.ends_with(b".build-dependencies]")));
+            continue;
+        }
+        if !dependencies {
+            continue;
+        }
+        let Some(equal) = line.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        let mut name = line[..equal].trim_ascii();
+        if name.len() >= 2 && matches!(name[0], b'\'' | b'"') && name[name.len() - 1] == name[0] {
+            name = &name[1..name.len() - 1];
+        } else if let Some(dot) = name.iter().position(|&byte| byte == b'.') {
+            name = name[..dot].trim_ascii_end();
+        }
+        if !name.is_empty()
+            && !result
+                .iter()
+                .any(|dependency| dependency.as_slice() == name)
+        {
+            result.push(name.to_vec());
+        }
+        let value = &line[equal + 1..];
+        if let Some(package_key) = value
+            .windows(b"package".len())
+            .position(|window| window == b"package")
+        {
+            let package_value = &value[package_key + b"package".len()..];
+            if let Some(assign) = package_value.iter().position(|&byte| byte == b'=') {
+                let package_value = package_value[assign + 1..].trim_ascii_start();
+                if let Some(&quote) = package_value.first()
+                    && matches!(quote, b'\'' | b'"')
+                    && let Some(end) = package_value[1..].iter().position(|&byte| byte == quote)
+                {
+                    let package = &package_value[1..end + 1];
+                    if !result
+                        .iter()
+                        .any(|dependency| dependency.as_slice() == package)
+                    {
+                        result.push(package.to_vec());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1848,6 +2103,60 @@ mod tests {
         let prefix = rust_method_complete(&buffer, buffer_len(&buffer), &corpus, &mut matches);
         assert_eq!(prefix, Some(source.len() - 2));
         assert_eq!(rust_method_name(&corpus, matches[0].item), "render");
+    }
+
+    #[test]
+    fn call_argument_type_retains_the_required_borrow_kind() {
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: false,
+        };
+        rust_index_source(
+            std::path::Path::new("src/editor.rs"),
+            b"pub fn editor_run(editor: &mut Editor, terminal: &Terminal) {}",
+            &mut corpus,
+        );
+        let buffer = buffer_from_bytes(b"editor_run(e");
+        let mut expected = Vec::new();
+        assert_eq!(
+            rust_call_argument_type(&buffer, buffer_len(&buffer), &corpus, &mut expected),
+            Some(RustBorrowKind::Mutable)
+        );
+        assert_eq!(expected, b"Editor");
+
+        let buffer = buffer_from_bytes(b"editor_run(editor, t");
+        assert_eq!(
+            rust_call_argument_type(&buffer, buffer_len(&buffer), &corpus, &mut expected),
+            Some(RustBorrowKind::Shared)
+        );
+        assert_eq!(expected, b"Terminal");
+    }
+
+    #[test]
+    fn cargo_dependency_parser_excludes_unreferenced_workspace_and_transitive_packages() {
+        let manifest = br#"
+[dependencies]
+bitfield.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+direct_macro = { package = "direct-macro", version = "1" }
+
+[workspace.dependencies]
+proc-macro2 = "1"
+windows-sys = "0.61"
+"#;
+        let mut dependencies = Vec::new();
+        rust_manifest_dependency_names(manifest, &mut dependencies);
+        assert!(dependencies.iter().any(|name| name == b"bitfield"));
+        assert!(dependencies.iter().any(|name| name == b"libc"));
+        assert!(dependencies.iter().any(|name| name == b"direct_macro"));
+        assert!(dependencies.iter().any(|name| name == b"direct-macro"));
+        assert!(!dependencies.iter().any(|name| name == b"proc-macro2"));
+        assert!(!dependencies.iter().any(|name| name == b"windows-sys"));
     }
 
     #[test]

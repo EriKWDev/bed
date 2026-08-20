@@ -24,11 +24,12 @@ use crate::project::{
     ProjectDiscoveryState, ProjectFiles, project_discover, project_discovery_step,
 };
 use crate::rust_methods::{
-    RustMethodCorpus, RustMethodIndex, rust_explicit_type, rust_free_function_complete,
-    rust_method_complete, rust_method_definition, rust_method_detail, rust_method_index_empty,
-    rust_method_index_finish, rust_method_index_pending, rust_method_index_poll,
-    rust_method_index_restart, rust_method_index_start, rust_method_name, rust_method_path,
-    rust_namespace_root, rust_symbol_detail, rust_symbol_name, rust_symbol_owner, rust_symbol_path,
+    RustBorrowKind, RustMethodCorpus, RustMethodIndex, rust_binding_type_at,
+    rust_call_argument_type, rust_explicit_type, rust_free_function_complete, rust_method_complete,
+    rust_method_definition, rust_method_detail, rust_method_index_empty, rust_method_index_finish,
+    rust_method_index_pending, rust_method_index_poll, rust_method_index_restart,
+    rust_method_index_start, rust_method_name, rust_method_path, rust_namespace_root,
+    rust_symbol_detail, rust_symbol_name, rust_symbol_owner, rust_symbol_path,
 };
 use crate::syntax::{
     SYNTAX_KIND_COUNT, SyntaxHighlighting, SyntaxKind, SyntaxSpan, syntax_highlighting_empty,
@@ -4883,6 +4884,7 @@ fn editor_collect_name_completions(
         Err(_) => return,
     };
     let mut qualifier = temp.vec(32);
+    let mut parent_qualifier = temp.vec(32);
     if prefix_start >= 2
         && buffer_byte(&editor_document(editor).buffer, prefix_start - 1) == b':'
         && buffer_byte(&editor_document(editor).buffer, prefix_start - 2) == b':'
@@ -4896,11 +4898,37 @@ fn editor_collect_name_completions(
         for position in start..prefix_start - 2 {
             qualifier.push(buffer_byte(&editor_document(editor).buffer, position));
         }
+        if start >= 2
+            && buffer_byte(&editor_document(editor).buffer, start - 1) == b':'
+            && buffer_byte(&editor_document(editor).buffer, start - 2) == b':'
+        {
+            let parent_end = start - 2;
+            let mut parent_start = parent_end;
+            while parent_start > 0
+                && rust_identifier_byte(buffer_byte(
+                    &editor_document(editor).buffer,
+                    parent_start - 1,
+                ))
+            {
+                parent_start -= 1;
+            }
+            for position in parent_start..parent_end {
+                parent_qualifier.push(buffer_byte(&editor_document(editor).buffer, position));
+            }
+        }
     }
 
     let document = editor_document(editor);
+    let mut expected_type = temp.vec(32);
+    let expected_borrow = rust_call_argument_type(
+        &document.buffer,
+        insertion_point,
+        &editor.rust_methods.corpus,
+        &mut expected_type,
+    );
     let mut local_bytes = temp.vec(1024);
     let mut local_ranges = temp.vec(document.code_index.symbols.len());
+    let mut local_identifiers = temp.vec(document.code_index.symbols.len());
     for symbol in &document.code_index.symbols {
         if !qualifier.is_empty() {
             break;
@@ -4920,6 +4948,7 @@ fn editor_collect_name_completions(
             local_bytes.push(buffer_byte(&document.buffer, position));
         }
         local_ranges.push(start..local_bytes.len());
+        local_identifiers.push(*identifier);
     }
     let mut labels = temp.vec(local_ranges.len());
     for range in &local_ranges {
@@ -4927,20 +4956,46 @@ fn editor_collect_name_completions(
     }
     let mut local_matches = temp.vec(local_ranges.len());
     fuzzy_rank(query, &labels, &mut local_matches);
-    for found in local_matches.iter().take(32) {
-        let name = labels[found.item];
-        completion_entry_push(
-            completion,
-            CompletionCandidate {
-                name,
-                detail: "local",
-                insertion: name.as_bytes(),
-                selection: 0..0,
-                replacement_start: prefix_start,
-                symbol: u32::MAX,
-                flags: 0,
-            },
-        );
+    let mut local_type = temp.vec(32);
+    let mut local_insertion = temp.vec(64);
+    for compatible_only in [true, false] {
+        for found in local_matches.iter().take(32) {
+            let identifier = local_identifiers[found.item];
+            let compatible = expected_borrow.is_some()
+                && rust_binding_type_at(
+                    &document.buffer,
+                    identifier.start as usize,
+                    identifier.end as usize,
+                    &editor.rust_methods.corpus,
+                    &mut local_type,
+                )
+                && local_type == expected_type;
+            if compatible != compatible_only {
+                continue;
+            }
+            let name = labels[found.item];
+            local_insertion.clear();
+            if compatible {
+                match expected_borrow {
+                    Some(RustBorrowKind::Shared) => local_insertion.push(b'&'),
+                    Some(RustBorrowKind::Mutable) => local_insertion.extend_from_slice(b"&mut "),
+                    Some(RustBorrowKind::Owned) | None => {}
+                }
+            }
+            local_insertion.extend_from_slice(name.as_bytes());
+            completion_entry_push(
+                completion,
+                CompletionCandidate {
+                    name,
+                    detail: "local",
+                    insertion: &local_insertion,
+                    selection: 0..0,
+                    replacement_start: prefix_start,
+                    symbol: u32::MAX,
+                    flags: 0,
+                },
+            );
+        }
     }
 
     for &keyword in RUST_COMPLETION_KEYWORDS {
@@ -4970,14 +5025,31 @@ fn editor_collect_name_completions(
     } else {
         rust_namespace_root(&editor.rust_methods.corpus, &qualifier)
     };
+    let qualified_owner_path = (!parent_qualifier.is_empty())
+        .then(|| {
+            (0..editor.rust_methods.corpus.symbols.len()).find_map(|symbol| {
+                (rust_symbol_name(&editor.rust_methods.corpus, symbol).as_bytes() == qualifier
+                    && rust_symbol_path(&editor.rust_methods.corpus, symbol)
+                        .is_some_and(|path| rust_path_module_matches(path, &parent_qualifier)))
+                .then(|| rust_symbol_path(&editor.rust_methods.corpus, symbol))
+                .flatten()
+            })
+        })
+        .flatten();
     for symbol in 0..editor.rust_methods.corpus.symbols.len() {
         let label = rust_symbol_name(&editor.rust_methods.corpus, symbol);
-        let qualified_match = qualifier.is_empty()
-            || rust_symbol_owner(&editor.rust_methods.corpus, symbol).as_bytes() == qualifier
-            || rust_symbol_path(&editor.rust_methods.corpus, symbol).is_some_and(|path| {
-                rust_path_module_matches(path, &qualifier)
-                    || namespace_root.is_some_and(|root| path.starts_with(root))
-            });
+        let qualified_match = if qualifier.is_empty() {
+            true
+        } else if let Some(owner_path) = qualified_owner_path {
+            rust_symbol_owner(&editor.rust_methods.corpus, symbol).as_bytes() == qualifier
+                && rust_symbol_path(&editor.rust_methods.corpus, symbol) == Some(owner_path)
+        } else {
+            rust_symbol_owner(&editor.rust_methods.corpus, symbol).as_bytes() == qualifier
+                || rust_symbol_path(&editor.rust_methods.corpus, symbol).is_some_and(|path| {
+                    rust_path_module_matches(path, &qualifier)
+                        || namespace_root.is_some_and(|root| path.starts_with(root))
+                })
+        };
         if qualified_match && slice_starts_with_smart_case(label.as_bytes(), query.as_bytes()) {
             symbol_labels.push(label);
             symbol_indices.push(symbol);
@@ -7479,8 +7551,8 @@ fn rust_prelude_module(name: &[u8]) -> Option<&'static [u8]> {
         b"Default" => Some(b"default"),
         b"Into" | b"From" | b"TryFrom" | b"TryInto" => Some(b"convert"),
         b"Iterator" | b"IntoIterator" => Some(b"iter"),
-        b"Option" => Some(b"option"),
-        b"Result" => Some(b"result"),
+        b"None" | b"Some" | b"Option" => Some(b"option"),
+        b"Err" | b"Ok" | b"Result" => Some(b"result"),
         b"String" => Some(b"string"),
         b"ToOwned" => Some(b"borrow"),
         b"Vec" => Some(b"vec"),
@@ -11719,12 +11791,17 @@ mod tests {
             .rust_methods
             .corpus
             .bytes
-            .extend_from_slice(b"ModeModeInsertModeOther");
+            .extend_from_slice(b"ModeModeInsertModeOtherModeTransient");
         editor
             .rust_methods
             .corpus
             .paths
             .push(std::path::PathBuf::from("editor.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .paths
+            .push(std::path::PathBuf::from("proc-macro2/src/lib.rs"));
         editor.rust_methods.corpus.symbols.extend([
             crate::rust_methods::RustSymbol {
                 owner_start: 0,
@@ -11759,6 +11836,17 @@ mod tests {
                 detail_start: 0,
                 detail_end: 0,
             },
+            crate::rust_methods::RustSymbol {
+                owner_start: 23,
+                owner_end: 27,
+                name_start: 27,
+                name_end: 36,
+                path: 1,
+                position: 30,
+                end: 39,
+                detail_start: 0,
+                detail_end: 0,
+            },
         ]);
         let end = buffer_len(&editor.documents[0].buffer);
         editor.documents[0].cursor = end;
@@ -11767,6 +11855,12 @@ mod tests {
         editor_refresh_completion(&mut editor);
         let completion = editor.completion.as_ref().unwrap();
         assert_eq!(completion_name(completion, completion.matches[0]), "Insert");
+        assert!(
+            completion
+                .matches
+                .iter()
+                .all(|&entry| { completion_name(completion, entry) != "Transient" })
+        );
         assert_eq!(completion.selected, 0);
         assert!(!completion.preview);
         editor_handle_key(&mut editor, Key::Tab);
@@ -11903,6 +11997,71 @@ mod tests {
         editor_handle_key(&mut editor, Key::Tab);
         editor_handle_key(&mut editor, Key::BackTab);
         assert_eq!(editor.documents[0].insertion_points, [cursor]);
+    }
+
+    #[test]
+    fn call_argument_completion_inserts_the_borrow_required_by_the_parameter() {
+        let mut editor = editor_with_text("let mut editor: Editor; editor_run(e");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        let name = b"editor_run";
+        let detail = b"pub fn editor_run(editor: &mut Editor)";
+        editor.rust_methods.corpus.bytes.extend_from_slice(name);
+        let detail_start = editor.rust_methods.corpus.bytes.len();
+        editor.rust_methods.corpus.bytes.extend_from_slice(detail);
+        editor
+            .rust_methods
+            .corpus
+            .paths
+            .push(std::path::PathBuf::from("editor.rs"));
+        editor
+            .rust_methods
+            .corpus
+            .symbols
+            .push(crate::rust_methods::RustSymbol {
+                owner_start: 0,
+                owner_end: 0,
+                name_start: 0,
+                name_end: name.len() as u32,
+                path: 0,
+                position: 0,
+                end: name.len() as u32,
+                detail_start: detail_start as u32,
+                detail_end: (detail_start + detail.len()) as u32,
+            });
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].anchor = end;
+        editor.documents[0].cursor = end;
+        editor_handle_key(&mut editor, Key::Character('i'));
+        let temp = idno_std::mem().scratch().temp();
+        let mut expected = temp.vec(32);
+        assert_eq!(
+            rust_call_argument_type(
+                &editor.documents[0].buffer,
+                editor.documents[0].insertion_points[0],
+                &editor.rust_methods.corpus,
+                &mut expected,
+            ),
+            Some(RustBorrowKind::Mutable)
+        );
+        assert_eq!(expected, b"Editor");
+        editor_refresh_completion(&mut editor);
+
+        editor_handle_key(&mut editor, Key::Tab);
+        let completion = editor.completion.as_ref().unwrap();
+        assert_eq!(completion_name(completion, completion.matches[0]), "editor");
+        assert_eq!(
+            completion_insertion(completion, completion.matches[0]),
+            b"&mut editor"
+        );
+        editor_handle_key(&mut editor, Key::Enter);
+        assert_eq!(
+            contents(&editor),
+            b"let mut editor: Editor; editor_run(&mut editor"
+        );
     }
 
     #[test]
