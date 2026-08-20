@@ -1538,18 +1538,9 @@ pub fn document_replace_ranges(
     let temp = idno_std::mem().scratch().temp();
     let mut byte_edits = temp.vec(replacements.len());
     let mut line_edits = temp.vec(replacements.len());
-    let mut scan_position = 0;
-    let mut scan_line = 0;
     for replacement in replacements.iter() {
-        while scan_position < replacement.start {
-            scan_line += usize::from(buffer_byte(&document.buffer, scan_position) == b'\n');
-            scan_position += 1;
-        }
-        let start_line = scan_line;
-        while scan_position < replacement.end {
-            scan_line += usize::from(buffer_byte(&document.buffer, scan_position) == b'\n');
-            scan_position += 1;
-        }
+        let start_line = buffer_line_and_column(&document.buffer, replacement.start).0;
+        let end_line = buffer_line_and_column(&document.buffer, replacement.end).0;
         let inserted_lines = inserted_bytes[replacement.inserted.clone()]
             .iter()
             .filter(|&&byte| byte == b'\n')
@@ -1559,7 +1550,7 @@ pub fn document_replace_ranges(
             replacement.end,
             replacement.inserted.len(),
         ));
-        line_edits.push((start_line, scan_line, inserted_lines));
+        line_edits.push((start_line, end_line, inserted_lines));
     }
     syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
     code_index_invalidate(&mut document.code_index);
@@ -1615,18 +1606,21 @@ pub fn document_replace_ranges(
             inserted: replacement.inserted.clone(),
         });
     }
-    for atom in atoms.iter().rev() {
-        buffer_delete(
-            &mut document.buffer,
-            atom.before_start,
-            atom.before_start + atom.deleted.len(),
-        );
-        buffer_insert(
-            &mut document.buffer,
-            atom.before_start,
-            &inserted_bytes[atom.inserted.clone()],
-        );
-    }
+    let mut buffer_replacements = temp.vec(replacements.len());
+    buffer_replacements.extend(replacements.iter().map(|replacement| {
+        (
+            replacement.start,
+            replacement.end,
+            replacement.inserted.clone(),
+        )
+    }));
+    let mut previous_line_starts = temp.vec(document.buffer.line_starts.len());
+    buffer_replace_ranges(
+        &mut document.buffer,
+        &buffer_replacements,
+        inserted_bytes,
+        &mut previous_line_starts,
+    );
     let mut after = Vec::with_capacity(before.len().max(atoms.len()));
     if let Some(requested_after) = requested_after {
         after.extend_from_slice(requested_after);
@@ -3844,7 +3838,9 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
             }
             document_replace_ranges(document, &mut replacements, &[], None);
         }
-        Key::Enter if editor.completion.is_some() => editor_accept_completion(editor),
+        Key::Enter if editor.completion.is_some() => {
+            editor_accept_completion(editor);
+        }
         Key::Enter => {
             editor.completion = None;
             editor_insert_newline(editor);
@@ -3870,12 +3866,16 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
         Key::BackTab if editor.completion.is_some() => editor_select_completion(editor, false),
         Key::BackTab => {}
         Key::Character(character) => {
-            if editor
+            let completion_previewed = editor
                 .completion
                 .as_ref()
-                .is_some_and(|completion| completion.preview)
-            {
-                editor_accept_completion(editor);
+                .is_some_and(|completion| completion.preview);
+            let replace_placeholder = completion_previewed && editor_accept_completion(editor);
+            let mut encoded = [0; 4];
+            let encoded = character.encode_utf8(&mut encoded);
+            if replace_placeholder && editor_replace_completion_placeholders(editor, encoded) {
+                editor_refresh_completion(editor);
+                return false;
             }
             if editor.config.flags.contains(EditorFlags::AUTO_PAIRS)
                 && editor_insert_auto_pair(editor, character)
@@ -3883,8 +3883,7 @@ fn editor_handle_insert_key(editor: &mut Editor, key: Key) -> bool {
                 editor_refresh_completion(editor);
                 return false;
             }
-            let mut encoded = [0; 4];
-            editor_insert(editor, character.encode_utf8(&mut encoded));
+            editor_insert(editor, encoded);
             editor_refresh_completion(editor);
         }
         Key::Control(14) | Key::Down if editor.completion.is_some() => {
@@ -4169,6 +4168,48 @@ fn editor_insert(editor: &mut Editor, text: &str) {
     }
     document_replace_ranges(document, &mut replacements, text.as_bytes(), None);
     editor.quit_warning = false;
+}
+
+fn editor_replace_completion_placeholders(editor: &mut Editor, text: &str) -> bool {
+    profiling::function_scope!();
+    let document = editor_document_mut(editor);
+    let temp = idno_std::mem().scratch().temp();
+    let mut selections = temp.vec(document.secondary_selections.len() + 1);
+    document_selections(document, &mut selections);
+    if selections.is_empty()
+        || selections
+            .iter()
+            .any(|selection| selection.anchor == selection.cursor)
+    {
+        return false;
+    }
+    selections.sort_unstable_by_key(|selection| selection.anchor.min(selection.cursor));
+    let mut replacements = temp.vec(selections.len());
+    for selection in &selections {
+        replacements.push(Replacement {
+            start: selection.anchor.min(selection.cursor),
+            end: buffer_next_char(&document.buffer, selection.anchor.max(selection.cursor)),
+            inserted: 0..text.len(),
+        });
+    }
+    let mut after = temp.vec(replacements.len());
+    let mut insertion_points = temp.vec(replacements.len());
+    for replacement in &replacements {
+        let start = offset_after_replacements(replacement.start, false, &replacements);
+        let end = start + text.len();
+        after.push(SelectionState {
+            anchor: start,
+            cursor: start,
+        });
+        insertion_points.push(end);
+    }
+    document_replace_ranges(document, &mut replacements, text.as_bytes(), Some(&after));
+    document.insertion_points.clear();
+    document
+        .insertion_points
+        .extend_from_slice(&insertion_points);
+    editor.quit_warning = false;
+    true
 }
 
 fn editor_insert_indentation(editor: &mut Editor) {
@@ -4624,13 +4665,13 @@ fn rust_reference_completion(buffer: &GapBuffer, insertion_point: usize) -> bool
     (0..5).all(|offset| buffer_byte(buffer, start + offset) == b"&mut "[offset])
 }
 
-fn editor_accept_completion(editor: &mut Editor) {
+fn editor_accept_completion(editor: &mut Editor) -> bool {
     profiling::function_scope!();
     let Some(completion) = editor.completion.take() else {
-        return;
+        return false;
     };
     let Some(found) = completion.matches.get(completion.selected) else {
-        return;
+        return false;
     };
     let temp = idno_std::mem().scratch().temp();
     let insertion = completion_insertion(&completion, *found);
@@ -4681,6 +4722,7 @@ fn editor_accept_completion(editor: &mut Editor) {
     document
         .insertion_points
         .extend_from_slice(&insertion_points);
+    found.selection_end > found.selection_start
 }
 
 fn editor_insert_completion_import(editor: &mut Editor, symbol: u32) {
@@ -11698,6 +11740,10 @@ mod tests {
         let completion = editor.completion.as_ref().unwrap();
         assert_eq!(completion.selected, 0);
         assert!(completion.preview);
+        assert_eq!(
+            completion_insertion(completion, completion.matches[0]),
+            b"Insert"
+        );
         editor_handle_key(&mut editor, Key::Character(':'));
         assert_eq!(contents(&editor), b"editor::Mode::Insert:");
     }
@@ -11841,6 +11887,57 @@ mod tests {
         assert_eq!(
             &insertion[selection.start as usize..selection.end as usize],
             b"&mut editor"
+        );
+    }
+
+    #[test]
+    fn typing_after_previewed_callable_completion_replaces_the_argument_placeholder() {
+        let mut editor = editor_with_text("let mut a: Vec<u32> = vec![0u32];\na.pu");
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        let end = buffer_len(&editor.documents[0].buffer);
+        editor.documents[0].anchor = end;
+        editor.documents[0].cursor = end;
+        editor.documents[0].insertion_points.push(end);
+        document_begin_transaction(&mut editor.documents[0]);
+        editor.mode = Mode::Insert;
+        let temp = idno_std::mem().scratch().temp();
+        let mut insertion = temp.vec(32);
+        let selection = rust_callable_insertion(
+            "push",
+            "pub fn push(&mut self, value: T)",
+            None,
+            true,
+            &mut insertion,
+        );
+        let mut completion = Completion {
+            bytes: Vec::new(),
+            matches: Vec::new(),
+            selected: 0,
+            prefix_start: end - 2,
+            preview: false,
+        };
+        completion_entry_push(
+            &mut completion,
+            CompletionCandidate {
+                name: "push",
+                detail: "pub fn push(&mut self, value: T)",
+                insertion: &insertion,
+                selection,
+                replacement_start: end - 2,
+                symbol: u32::MAX,
+                flags: 0,
+            },
+        );
+        editor.completion = Some(completion);
+
+        editor_handle_key(&mut editor, Key::Tab);
+        editor_handle_key(&mut editor, Key::Character('1'));
+        editor_handle_key(&mut editor, Key::Character('2'));
+        editor_handle_key(&mut editor, Key::Character('3'));
+
+        assert_eq!(
+            contents(&editor),
+            b"let mut a: Vec<u32> = vec![0u32];\na.push(123)"
         );
     }
 

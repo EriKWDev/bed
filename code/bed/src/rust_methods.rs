@@ -222,20 +222,52 @@ pub fn rust_method_definition(
     while name_end < length && rust_identifier_byte(buffer_byte(buffer, name_end)) {
         name_end += 1;
     }
-    if name_start == name_end || name_start == 0 || buffer_byte(buffer, name_start - 1) != b'.' {
+    if name_start == name_end || name_start == 0 {
         return None;
     }
-    let receiver_end = name_start - 1;
     let temp = idno_std::mem().scratch().temp();
     let mut owner = temp.vec(32);
-    if !rust_receiver_type(buffer, receiver_end, corpus, &mut owner) {
+    if buffer_byte(buffer, name_start - 1) == b'.' {
+        let receiver_end = name_start - 1;
+        if !rust_receiver_type(buffer, receiver_end, corpus, &mut owner) {
+            return None;
+        }
+    } else if name_start >= 2
+        && buffer_byte(buffer, name_start - 1) == b':'
+        && buffer_byte(buffer, name_start - 2) == b':'
+    {
+        let mut owner_end = name_start - 2;
+        while owner_end > 0 && buffer_byte(buffer, owner_end - 1).is_ascii_whitespace() {
+            owner_end -= 1;
+        }
+        let mut owner_start = owner_end;
+        while owner_start > 0 && rust_identifier_byte(buffer_byte(buffer, owner_start - 1)) {
+            owner_start -= 1;
+        }
+        if owner_start == owner_end {
+            return None;
+        }
+        for position in owner_start..owner_end {
+            owner.push(buffer_byte(buffer, position));
+        }
+    } else {
         return None;
     }
+    rust_method_with_owner_and_name(buffer, name_start, name_end, corpus, &owner)
+}
+
+fn rust_method_with_owner_and_name(
+    buffer: &GapBuffer,
+    name_start: usize,
+    name_end: usize,
+    corpus: &RustMethodCorpus,
+    owner: &[u8],
+) -> Option<usize> {
     let first = corpus.methods.partition_point(|method| {
-        &corpus.bytes[method.owner_start as usize..method.owner_end as usize] < owner.as_slice()
+        &corpus.bytes[method.owner_start as usize..method.owner_end as usize] < owner
     });
     let last = corpus.methods.partition_point(|method| {
-        &corpus.bytes[method.owner_start as usize..method.owner_end as usize] <= owner.as_slice()
+        &corpus.bytes[method.owner_start as usize..method.owner_end as usize] <= owner
     });
     corpus.methods[first..last]
         .iter()
@@ -328,10 +360,11 @@ fn rust_receiver_type(
             let temp = idno_std::mem().scratch().temp();
             let mut receiver_type = temp.vec(32);
             if receiver_start < expression_start - 1
-                && rust_explicit_type(
+                && rust_binding_type(
                     buffer,
                     receiver_start,
                     expression_start - 1,
+                    corpus,
                     &mut receiver_type,
                 )
                 && rust_struct_field_type(
@@ -346,7 +379,7 @@ fn rust_receiver_type(
             }
         }
         return expression_start < expression_end
-            && rust_explicit_type(buffer, expression_start, expression_end, owner);
+            && rust_binding_type(buffer, expression_start, expression_end, corpus, owner);
     }
     let mut position = expression_end - 1;
     let mut depth = 1usize;
@@ -526,23 +559,82 @@ fn rust_struct_field_type(
 }
 
 fn rust_callable_return_type(detail: &[u8], result: &mut Vec<u8, impl Allocator>) -> bool {
+    profiling::function_scope!();
     result.clear();
+    let Some(mut position) = rust_callable_return_start(detail) else {
+        return false;
+    };
+    rust_type_terminal_identifier(detail, &mut position, result)
+}
+
+fn rust_callable_return_payload_type(detail: &[u8], result: &mut Vec<u8, impl Allocator>) -> bool {
+    profiling::function_scope!();
+    result.clear();
+    let Some(mut position) = rust_callable_return_start(detail) else {
+        return false;
+    };
+    let temp = idno_std::mem().scratch().temp();
+    let mut wrapper = temp.vec(16);
+    if !rust_type_terminal_identifier(detail, &mut position, &mut wrapper)
+        || !matches!(wrapper.as_slice(), b"Result" | b"Option")
+    {
+        return false;
+    }
+    while position < detail.len() && detail[position].is_ascii_whitespace() {
+        position += 1;
+    }
+    if position >= detail.len() || detail[position] != b'<' {
+        return false;
+    }
+    position += 1;
+    rust_type_terminal_identifier(detail, &mut position, result)
+}
+
+fn rust_callable_return_start(detail: &[u8]) -> Option<usize> {
     let mut position = 0usize;
     while position + 1 < detail.len() {
         if detail[position] == b'-' && detail[position + 1] == b'>' {
-            position += 2;
-            break;
+            return Some(position + 2);
         }
         position += 1;
     }
-    while position < detail.len() && !rust_identifier_byte(detail[position]) {
-        position += 1;
+    None
+}
+
+fn rust_type_terminal_identifier(
+    source: &[u8],
+    position: &mut usize,
+    result: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    while *position < source.len()
+        && (source[*position].is_ascii_whitespace() || matches!(source[*position], b'&' | b'\''))
+    {
+        *position += 1;
     }
-    while position < detail.len() && rust_identifier_byte(detail[position]) {
-        result.push(detail[position]);
-        position += 1;
+    if source.get(*position..*position + 4) == Some(b"mut ") {
+        *position += 4;
     }
-    !result.is_empty()
+    loop {
+        while *position < source.len() && source[*position].is_ascii_whitespace() {
+            *position += 1;
+        }
+        let start = *position;
+        while *position < source.len() && rust_identifier_byte(source[*position]) {
+            *position += 1;
+        }
+        if start == *position {
+            return false;
+        }
+        result.clear();
+        result.extend_from_slice(&source[start..*position]);
+        if *position + 1 >= source.len()
+            || source[*position] != b':'
+            || source[*position + 1] != b':'
+        {
+            return true;
+        }
+        *position += 2;
+    }
 }
 
 pub fn rust_free_function_complete(
@@ -560,7 +652,7 @@ pub fn rust_free_function_complete(
     };
     let temp = idno_std::mem().scratch().temp();
     let mut owner = temp.vec(32);
-    if !rust_explicit_type(buffer, receiver_start, receiver_end, &mut owner) {
+    if !rust_binding_type(buffer, receiver_start, receiver_end, corpus, &mut owner) {
         return None;
     }
     let mut labels = temp.vec(64);
@@ -704,6 +796,136 @@ pub fn rust_explicit_type(
                 continue;
             }
             return true;
+        }
+    }
+    false
+}
+
+fn rust_binding_type(
+    buffer: &GapBuffer,
+    receiver_start: usize,
+    receiver_end: usize,
+    corpus: &RustMethodCorpus,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    if rust_inferred_binding_type(buffer, receiver_start, receiver_end, corpus, owner) {
+        return true;
+    }
+    rust_explicit_type(buffer, receiver_start, receiver_end, owner)
+}
+
+fn rust_inferred_binding_type(
+    buffer: &GapBuffer,
+    receiver_start: usize,
+    receiver_end: usize,
+    corpus: &RustMethodCorpus,
+    owner: &mut Vec<u8, impl Allocator>,
+) -> bool {
+    profiling::function_scope!();
+    let name_length = receiver_end.saturating_sub(receiver_start);
+    let mut search = receiver_start;
+    while search > 0 {
+        search -= 1;
+        if !rust_range_equal(
+            buffer,
+            search,
+            search + name_length,
+            receiver_start,
+            receiver_end,
+        ) {
+            continue;
+        }
+        let after_name = search + name_length;
+        if (search > 0 && rust_identifier_byte(buffer_byte(buffer, search - 1)))
+            || (after_name < buffer_len(buffer)
+                && rust_identifier_byte(buffer_byte(buffer, after_name)))
+            || !rust_identifier_is_let_binding(buffer, search)
+        {
+            continue;
+        }
+        let mut position = after_name;
+        rust_skip_buffer_whitespace(buffer, &mut position);
+        if position >= buffer_len(buffer) || buffer_byte(buffer, position) != b'=' {
+            continue;
+        }
+        position += 1;
+        rust_skip_buffer_whitespace(buffer, &mut position);
+        let matched = rust_buffer_word_equal(buffer, position, b"match");
+        if matched {
+            position += b"match".len();
+            rust_skip_buffer_whitespace(buffer, &mut position);
+        }
+        let call_start = position;
+        let mut call_name_start = position;
+        let mut call_name_end = position;
+        let mut module_start = position;
+        let mut module_end = position;
+        loop {
+            let identifier_start = position;
+            while position < buffer_len(buffer)
+                && rust_identifier_byte(buffer_byte(buffer, position))
+            {
+                position += 1;
+            }
+            if identifier_start == position {
+                break;
+            }
+            call_name_start = identifier_start;
+            call_name_end = position;
+            if position + 1 >= buffer_len(buffer)
+                || buffer_byte(buffer, position) != b':'
+                || buffer_byte(buffer, position + 1) != b':'
+            {
+                break;
+            }
+            module_start = identifier_start;
+            module_end = position;
+            position += 2;
+        }
+        rust_skip_buffer_whitespace(buffer, &mut position);
+        if call_start == call_name_end
+            || position >= buffer_len(buffer)
+            || buffer_byte(buffer, position) != b'('
+        {
+            continue;
+        }
+        for symbol in 0..corpus.symbols.len() {
+            let name = rust_symbol_name(corpus, symbol).as_bytes();
+            if name.len() != call_name_end - call_name_start
+                || !name
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, &byte)| byte == buffer_byte(buffer, call_name_start + offset))
+            {
+                continue;
+            }
+            if module_start < module_end {
+                let Some(path) = rust_symbol_path(corpus, symbol) else {
+                    continue;
+                };
+                let module_matches = path
+                    .file_stem()
+                    .map(std::ffi::OsStr::as_encoded_bytes)
+                    .is_some_and(|module| {
+                        module.len() == module_end - module_start
+                            && module.iter().enumerate().all(|(offset, &byte)| {
+                                byte == buffer_byte(buffer, module_start + offset)
+                            })
+                    });
+                if !module_matches {
+                    continue;
+                }
+            }
+            let detail = rust_symbol_detail(corpus, symbol).as_bytes();
+            let inferred = if matched {
+                rust_callable_return_payload_type(detail, owner)
+            } else {
+                rust_callable_return_type(detail, owner)
+            };
+            if inferred {
+                return true;
+            }
         }
     }
     false
@@ -1600,6 +1822,35 @@ mod tests {
     }
 
     #[test]
+    fn match_result_binding_infers_the_success_value_type_for_completion() {
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: true,
+        };
+        rust_index_source(
+            std::path::Path::new("src/editor.rs"),
+            b"pub fn editor_open() -> std::io::Result<Editor> {}\nimpl Editor { pub fn render(&mut self) {} }",
+            &mut corpus,
+        );
+        corpus.methods.sort_unstable_by(|left, right| {
+            let left_owner = &corpus.bytes[left.owner_start as usize..left.owner_end as usize];
+            let right_owner = &corpus.bytes[right.owner_start as usize..right.owner_end as usize];
+            let left_name = &corpus.bytes[left.name_start as usize..left.name_end as usize];
+            let right_name = &corpus.bytes[right.name_start as usize..right.name_end as usize];
+            (left_owner, left_name).cmp(&(right_owner, right_name))
+        });
+        let source = b"let mut editor = match editor::editor_open() { Ok(editor) => editor, Err(error) => return Err(error), }; editor.re";
+        let buffer = buffer_from_bytes(source);
+        let mut matches = Vec::new();
+        let prefix = rust_method_complete(&buffer, buffer_len(&buffer), &corpus, &mut matches);
+        assert_eq!(prefix, Some(source.len() - 2));
+        assert_eq!(rust_method_name(&corpus, matches[0].item), "render");
+    }
+
+    #[test]
     fn indexes_top_level_symbols_and_method_locations() {
         let source = b"pub enum Option<T> { None, Some(T) }\nimpl<T> Option<T> { pub fn get_or_insert(&mut self, value: T) {} }";
         let mut corpus = RustMethodCorpus {
@@ -1700,6 +1951,35 @@ mod tests {
         let cursor = source.windows(4).position(|word| word == b"join").unwrap();
         let method = rust_method_definition(&buffer, cursor, &corpus).unwrap();
         assert_eq!(rust_method_name(&corpus, method), "join");
+    }
+
+    #[test]
+    fn associated_function_definition_uses_the_qualified_type_owner() {
+        let mut corpus = RustMethodCorpus {
+            bytes: Vec::new(),
+            methods: Vec::new(),
+            symbols: Vec::new(),
+            paths: Vec::new(),
+            standard_library_available: true,
+        };
+        rust_index_source(
+            std::path::Path::new("library/core/src/time.rs"),
+            b"impl Duration { pub const fn from_millis(millis: u64) -> Duration {} }",
+            &mut corpus,
+        );
+        corpus.methods.sort_unstable_by(|left, right| {
+            let left_owner = &corpus.bytes[left.owner_start as usize..left.owner_end as usize];
+            let right_owner = &corpus.bytes[right.owner_start as usize..right.owner_end as usize];
+            (left_owner, left.name_start).cmp(&(right_owner, right.name_start))
+        });
+        let source = b"std::time::Duration::from_millis(1)";
+        let buffer = buffer_from_bytes(source);
+        let cursor = source
+            .windows(b"from_millis".len())
+            .position(|word| word == b"from_millis")
+            .unwrap();
+        let method = rust_method_definition(&buffer, cursor, &corpus).unwrap();
+        assert_eq!(rust_method_name(&corpus, method), "from_millis");
     }
 
     #[test]

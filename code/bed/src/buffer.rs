@@ -107,6 +107,89 @@ pub fn buffer_delete(buffer: &mut GapBuffer, start: usize, end: usize) {
     buffer.gap_end += end - start;
 }
 
+pub fn buffer_replace_ranges(
+    buffer: &mut GapBuffer,
+    replacements: &[(usize, usize, std::ops::Range<usize>)],
+    inserted: &[u8],
+    previous_line_starts: &mut Vec<u32, impl Allocator>,
+) {
+    profiling::function_scope!();
+    if replacements.is_empty() {
+        return;
+    }
+    debug_assert!(replacements.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    let final_length = replacements
+        .iter()
+        .fold(buffer_len(buffer), |length, edit| {
+            length - (edit.1 - edit.0) + edit.2.len()
+        });
+    assert!(u32::try_from(final_length).is_ok());
+
+    previous_line_starts.clear();
+    previous_line_starts.extend_from_slice(&buffer.line_starts);
+    let inserted_lines = replacements
+        .iter()
+        .map(|edit| {
+            inserted[edit.2.clone()]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+        })
+        .sum::<usize>();
+    buffer
+        .line_starts
+        .reserve(previous_line_starts.len() + inserted_lines);
+    buffer.line_starts.clear();
+    let mut previous_line = 0usize;
+    let mut shift = 0isize;
+    for &(start, end, ref inserted_range) in replacements {
+        while previous_line < previous_line_starts.len()
+            && previous_line_starts[previous_line] as usize <= start
+        {
+            buffer
+                .line_starts
+                .push((previous_line_starts[previous_line] as isize + shift) as u32);
+            previous_line += 1;
+        }
+        while previous_line < previous_line_starts.len()
+            && previous_line_starts[previous_line] as usize <= end
+        {
+            previous_line += 1;
+        }
+        let after_start = (start as isize + shift) as usize;
+        for (offset, &byte) in inserted[inserted_range.clone()].iter().enumerate() {
+            if byte == b'\n' {
+                buffer.line_starts.push((after_start + offset + 1) as u32);
+            }
+        }
+        shift += inserted_range.len() as isize - (end - start) as isize;
+    }
+    while previous_line < previous_line_starts.len() {
+        buffer
+            .line_starts
+            .push((previous_line_starts[previous_line] as isize + shift) as u32);
+        previous_line += 1;
+    }
+
+    for &(start, end, ref inserted_range) in replacements.iter().rev() {
+        buffer_delete_bytes(buffer, start, end);
+        buffer_insert_bytes(buffer, start, &inserted[inserted_range.clone()]);
+    }
+}
+
+fn buffer_insert_bytes(buffer: &mut GapBuffer, position: usize, inserted: &[u8]) {
+    buffer_move_gap(buffer, position);
+    buffer_reserve_gap(buffer, inserted.len());
+    let end = buffer.gap_start + inserted.len();
+    buffer.bytes[buffer.gap_start..end].copy_from_slice(inserted);
+    buffer.gap_start = end;
+}
+
+fn buffer_delete_bytes(buffer: &mut GapBuffer, start: usize, end: usize) {
+    buffer_move_gap(buffer, start);
+    buffer.gap_end += end - start;
+}
+
 pub fn buffer_next_char(buffer: &GapBuffer, position: usize) -> usize {
     let length = buffer_len(buffer);
     let mut next = (position + 1).min(length);
@@ -400,6 +483,29 @@ mod tests {
         assert_eq!(buffer.line_starts, [0, 7]);
         assert_eq!(buffer_line_end(&buffer, 2), 6);
         assert_eq!(buffer_line_start(&buffer, 7), 7);
+    }
+
+    #[test]
+    fn batched_replacements_rebuild_the_line_index_in_one_merge() {
+        let mut buffer = buffer_from_bytes(b"aa\nbb\ncc\ndd");
+        let replacements = [(1, 2, 0..2), (6, 9, 2..5), (10, 10, 5..7)];
+        let inserted = b"X\nY\n\nZ\n";
+        let mut previous_line_starts = Vec::new();
+        buffer_replace_ranges(
+            &mut buffer,
+            &replacements,
+            inserted,
+            &mut previous_line_starts,
+        );
+        assert_eq!(contents(&buffer), b"aX\n\nbb\nY\n\ndZ\nd");
+        assert_eq!(buffer.line_starts, [0, 3, 4, 7, 9, 10, 13]);
+        for position in 0..=buffer_len(&buffer) {
+            let (line, column) = buffer_line_and_column(&buffer, position);
+            assert_eq!(
+                buffer_position_at_line_column(&buffer, line, column),
+                position
+            );
+        }
     }
 
     #[test]
