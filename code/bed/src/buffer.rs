@@ -310,10 +310,14 @@ pub fn buffer_line_end(buffer: &GapBuffer, position: usize) -> usize {
         .line_starts
         .partition_point(|&line_start| line_start <= position)
         .saturating_sub(1);
-    buffer
+    let mut end = buffer
         .line_starts
         .get(line + 1)
-        .map_or(buffer_len(buffer), |&next_line| next_line as usize - 1)
+        .map_or(buffer_len(buffer), |&next_line| next_line as usize - 1);
+    if end > 0 && buffer_byte(buffer, end - 1) == b'\r' {
+        end -= 1;
+    }
+    end
 }
 
 pub fn buffer_line_and_column(buffer: &GapBuffer, position: usize) -> (usize, usize) {
@@ -483,6 +487,14 @@ mod tests {
         assert_eq!(buffer.line_starts, [0, 7]);
         assert_eq!(buffer_line_end(&buffer, 2), 6);
         assert_eq!(buffer_line_start(&buffer, 7), 7);
+    }
+
+    #[test]
+    fn line_end_excludes_both_bytes_of_a_crlf_separator() {
+        let buffer = buffer_from_bytes(b"one\r\ntwo\r\n");
+        assert_eq!(buffer_line_end(&buffer, 0), 3);
+        assert_eq!(buffer_line_end(&buffer, 5), 8);
+        assert_eq!(buffer_line_start(&buffer, 5), 5);
     }
 
     #[test]
