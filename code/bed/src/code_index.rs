@@ -144,11 +144,17 @@ fn code_index_scan_code(buffer: &GapBuffer, index: &mut CodeIndex, length: usize
         index.mode = CodeIndexMode::BlockComment;
         index.block_depth = 1;
         index.position += 2;
-    } else if byte == b'\''
-        && code_rust_lifetime_end(buffer, index.position, length) > index.position
-    {
-        index.position = code_rust_lifetime_end(buffer, index.position, length);
-    } else if matches!(byte, b'\'' | b'"') {
+    } else if byte == b'\'' {
+        let lifetime_end = code_rust_lifetime_end(buffer, index.position, length);
+        if lifetime_end > index.position {
+            index.position = lifetime_end;
+        } else {
+            index.mode = CodeIndexMode::String;
+            index.delimiter = byte;
+            index.escaped = false;
+            index.position += 1;
+        }
+    } else if byte == b'"' {
         index.mode = CodeIndexMode::String;
         index.delimiter = byte;
         index.escaped = false;

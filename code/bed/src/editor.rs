@@ -1314,39 +1314,39 @@ fn editor_reindex_workspace(editor: &mut Editor) {
 fn workspace_snapshot(root: std::path::PathBuf) -> WorkspaceSnapshot {
     profiling::function_scope!();
     let project = project_discover(root, usize::MAX).project;
-    let mut fingerprint = 0xcbf29ce484222325u64;
+    let temp = idno_std::mem().scratch().temp();
+    let mut fingerprint_bytes = temp.vec(project.paths.len() * 32);
     for path in project.paths.iter() {
-        for &byte in path.as_os_str().as_encoded_bytes() {
-            fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-        }
+        fingerprint_bytes.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        fingerprint_bytes.push(0);
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        fingerprint = (fingerprint ^ metadata.len()).wrapping_mul(0x100000001b3);
+        fingerprint_bytes.extend_from_slice(&metadata.len().to_ne_bytes());
         if let Ok(modified) = metadata.modified()
             && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
         {
-            fingerprint = (fingerprint ^ duration.as_secs()).wrapping_mul(0x100000001b3);
-            fingerprint =
-                (fingerprint ^ u64::from(duration.subsec_nanos())).wrapping_mul(0x100000001b3);
+            fingerprint_bytes.extend_from_slice(&duration.as_secs().to_ne_bytes());
+            fingerprint_bytes.extend_from_slice(&duration.subsec_nanos().to_ne_bytes());
         }
     }
     if let Some(ignore_file) = project.ignore_file.as_deref()
         && let Ok(metadata) = std::fs::metadata(ignore_file)
     {
-        fingerprint = (fingerprint ^ metadata.len()).wrapping_mul(0x100000001b3);
+        fingerprint_bytes.extend_from_slice(ignore_file.as_os_str().as_encoded_bytes());
+        fingerprint_bytes.push(0);
+        fingerprint_bytes.extend_from_slice(&metadata.len().to_ne_bytes());
         if let Ok(modified) = metadata.modified()
             && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
         {
-            fingerprint = (fingerprint ^ duration.as_secs()).wrapping_mul(0x100000001b3);
-            fingerprint =
-                (fingerprint ^ u64::from(duration.subsec_nanos())).wrapping_mul(0x100000001b3);
+            fingerprint_bytes.extend_from_slice(&duration.as_secs().to_ne_bytes());
+            fingerprint_bytes.extend_from_slice(&duration.subsec_nanos().to_ne_bytes());
         }
     }
     WorkspaceSnapshot {
         project,
-        fingerprint,
+        fingerprint: idno_std::utils::hash_rapid_bytes(&fingerprint_bytes),
     }
 }
 
@@ -9129,7 +9129,9 @@ fn editor_present_document_rows(
         for range in row_ranges {
             editor
                 .rendered_row_hashes
-                .push(render_bytes_hash(&editor.frame[range.clone()]));
+                .push(idno_std::utils::hash_rapid_bytes(
+                    &editor.frame[range.clone()],
+                ));
         }
         return terminal::terminal_present(terminal, &editor.frame);
     }
@@ -9138,7 +9140,7 @@ fn editor_present_document_rows(
         .present_frame
         .extend_from_slice(b"\x1b[?2026h\x1b[?7l\x1b[?25l");
     for (row, range) in row_ranges.iter().enumerate() {
-        let hash = render_bytes_hash(&editor.frame[range.clone()]);
+        let hash = idno_std::utils::hash_rapid_bytes(&editor.frame[range.clone()]);
         let overlay_dirty = dirty_overlay_start.is_some_and(|start| row >= start);
         if hash != editor.rendered_row_hashes[row] || overlay_dirty {
             write!(&mut editor.present_frame, "\x1b[{};1H", row + 1).unwrap();
@@ -9152,14 +9154,6 @@ fn editor_present_document_rows(
         .present_frame
         .extend_from_slice(&editor.frame[status_start..]);
     terminal::terminal_present(terminal, &editor.present_frame)
-}
-
-fn render_bytes_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn buffer_terminal_column(buffer: &GapBuffer, position: usize, tab_width: usize) -> usize {
