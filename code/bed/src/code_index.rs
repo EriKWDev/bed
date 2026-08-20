@@ -33,6 +33,7 @@ pub enum CodeIndexMode {
 pub struct CodeIndex {
     pub identifiers: Vec<CodeIdentifier>,
     pub symbols: Vec<CodeSymbol>,
+    pub checkpoints: Vec<CodeIndexCheckpoint>,
     pub position: usize,
     pub scope_depth: u16,
     pub block_depth: u16,
@@ -44,10 +45,24 @@ pub struct CodeIndex {
     pub complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeIndexCheckpoint {
+    pub position: u32,
+    pub identifier_count: u32,
+    pub symbol_count: u32,
+    pub scope_depth: u16,
+    pub block_depth: u16,
+    pub mode: CodeIndexMode,
+    pub delimiter: u8,
+    pub escaped: bool,
+    pub expected_symbol: Option<CodeSymbolKind>,
+}
+
 pub fn code_index_empty() -> CodeIndex {
     CodeIndex {
         identifiers: Vec::new(),
         symbols: Vec::new(),
+        checkpoints: Vec::new(),
         position: 0,
         scope_depth: 0,
         block_depth: 0,
@@ -74,6 +89,7 @@ pub fn code_index_invalidate(index: &mut CodeIndex) {
     let CodeIndex {
         identifiers,
         symbols,
+        checkpoints,
         position,
         scope_depth,
         block_depth,
@@ -86,6 +102,7 @@ pub fn code_index_invalidate(index: &mut CodeIndex) {
     } = index;
     identifiers.clear();
     symbols.clear();
+    checkpoints.clear();
     *position = 0;
     *scope_depth = 0;
     *block_depth = 0;
@@ -94,6 +111,58 @@ pub fn code_index_invalidate(index: &mut CodeIndex) {
     *escaped = false;
     *expected_symbol = None;
     *complete = !*enabled;
+    checkpoints.push(CodeIndexCheckpoint {
+        position: 0,
+        identifier_count: 0,
+        symbol_count: 0,
+        scope_depth: 0,
+        block_depth: 0,
+        mode: CodeIndexMode::Code,
+        delimiter: 0,
+        escaped: false,
+        expected_symbol: None,
+    });
+}
+
+pub fn code_index_invalidate_edits(index: &mut CodeIndex, edits: &[(usize, usize, usize)]) {
+    profiling::function_scope!();
+    if edits.is_empty() || !index.enabled {
+        return;
+    }
+    let first_edit = edits.iter().map(|edit| edit.0).min().unwrap_or(0);
+    let checkpoint_index = index
+        .checkpoints
+        .partition_point(|checkpoint| checkpoint.position as usize <= first_edit)
+        .saturating_sub(1);
+    let checkpoint =
+        index
+            .checkpoints
+            .get(checkpoint_index)
+            .copied()
+            .unwrap_or(CodeIndexCheckpoint {
+                position: 0,
+                identifier_count: 0,
+                symbol_count: 0,
+                scope_depth: 0,
+                block_depth: 0,
+                mode: CodeIndexMode::Code,
+                delimiter: 0,
+                escaped: false,
+                expected_symbol: None,
+            });
+    index
+        .identifiers
+        .truncate(checkpoint.identifier_count as usize);
+    index.symbols.truncate(checkpoint.symbol_count as usize);
+    index.checkpoints.truncate(checkpoint_index + 1);
+    index.position = checkpoint.position as usize;
+    index.scope_depth = checkpoint.scope_depth;
+    index.block_depth = checkpoint.block_depth;
+    index.mode = checkpoint.mode;
+    index.delimiter = checkpoint.delimiter;
+    index.escaped = checkpoint.escaped;
+    index.expected_symbol = checkpoint.expected_symbol;
+    index.complete = false;
 }
 
 pub fn code_index_step(
@@ -115,6 +184,7 @@ pub fn code_index_step(
         if index.position & 255 == 0 && started.elapsed() >= maximum_time {
             break;
         }
+        let previous_position = index.position;
         match index.mode {
             CodeIndexMode::Code => code_index_scan_code(buffer, index, length),
             CodeIndexMode::LineComment => {
@@ -127,11 +197,41 @@ pub fn code_index_step(
             CodeIndexMode::BlockComment => code_index_scan_block_comment(buffer, index, length),
             CodeIndexMode::String => code_index_scan_string(buffer, index),
         }
+        if index.position > previous_position && buffer_byte(buffer, index.position - 1) == b'\n' {
+            code_index_checkpoint_push(index);
+        }
     }
     if index.position >= length {
         index.complete = true;
     }
     index.identifiers.len() != original_identifiers
+}
+
+fn code_index_checkpoint_push(index: &mut CodeIndex) {
+    if index.position > u32::MAX as usize
+        || index.identifiers.len() > u32::MAX as usize
+        || index.symbols.len() > u32::MAX as usize
+    {
+        return;
+    }
+    let checkpoint = CodeIndexCheckpoint {
+        position: index.position as u32,
+        identifier_count: index.identifiers.len() as u32,
+        symbol_count: index.symbols.len() as u32,
+        scope_depth: index.scope_depth,
+        block_depth: index.block_depth,
+        mode: index.mode,
+        delimiter: index.delimiter,
+        escaped: index.escaped,
+        expected_symbol: index.expected_symbol,
+    };
+    if index
+        .checkpoints
+        .last()
+        .is_none_or(|previous| previous.position < checkpoint.position)
+    {
+        index.checkpoints.push(checkpoint);
+    }
 }
 
 fn code_index_scan_code(buffer: &GapBuffer, index: &mut CodeIndex, length: usize) {
@@ -489,7 +589,7 @@ fn code_rust_lifetime_end(buffer: &GapBuffer, start: usize, length: usize) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::buffer_from_bytes;
+    use crate::buffer::{buffer_delete, buffer_from_bytes, buffer_insert};
 
     #[test]
     fn local_definition_wins_over_outer_definition() {
@@ -512,6 +612,43 @@ mod tests {
             index.identifiers[index.symbols[outer_definition].identifier as usize].start,
             4
         );
+    }
+
+    #[test]
+    fn edit_invalidation_retains_the_prefix_and_resumes_at_a_checkpoint() {
+        let original = b"fn first() {\n    let one = 1;\n}\nfn second() {\n    let two = one;\n}\n";
+        let mut buffer = buffer_from_bytes(original);
+        let mut index = code_index_empty();
+        code_index_set_path(&mut index, Some(std::path::Path::new("main.rs")));
+        code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        let edit = original.windows(3).position(|word| word == b"two").unwrap();
+        let expected_restart = original[..edit]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .unwrap()
+            + 1;
+        code_index_invalidate_edits(&mut index, &[(edit, edit + 3, 5)]);
+        buffer_delete(&mut buffer, edit, edit + 3);
+        buffer_insert(&mut buffer, edit, b"other");
+
+        assert_eq!(index.position, expected_restart);
+        assert!(index.position > 0);
+        assert!(index.identifiers.iter().any(|identifier| {
+            code_range_equal(
+                &buffer,
+                identifier.start as usize,
+                identifier.end as usize,
+                b"first",
+            )
+        }));
+        while !index.complete {
+            code_index_step(&buffer, &mut index, usize::MAX, std::time::Duration::MAX);
+        }
+        let mut rebuilt = code_index_empty();
+        code_index_set_path(&mut rebuilt, Some(std::path::Path::new("main.rs")));
+        code_index_step(&buffer, &mut rebuilt, usize::MAX, std::time::Duration::MAX);
+        assert_eq!(index.identifiers, rebuilt.identifiers);
+        assert_eq!(index.symbols, rebuilt.symbols);
     }
 
     #[test]

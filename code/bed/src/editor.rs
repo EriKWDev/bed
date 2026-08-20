@@ -6,7 +6,7 @@ use std::io::Write as _;
 use crate::buffer::*;
 use crate::code_index::{
     CodeIndex, CodeSymbolKind, code_index_definition_for, code_index_definition_of_kind,
-    code_index_empty, code_index_identifier_at, code_index_invalidate, code_index_set_path,
+    code_index_empty, code_index_identifier_at, code_index_invalidate_edits, code_index_set_path,
     code_index_step,
 };
 use crate::diagnostics::{
@@ -1435,7 +1435,6 @@ pub fn document_undo(document: &mut Document) {
     let Some(transaction) = document.undo.pop() else {
         return;
     };
-    code_index_invalidate(&mut document.code_index);
     git_gutter_invalidate(&mut document.git_gutter);
     for edit in transaction.edits.iter().rev() {
         let temp = idno_std::mem().scratch().temp();
@@ -1454,6 +1453,7 @@ pub fn document_undo(document: &mut Document) {
             ));
         }
         syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
+        code_index_invalidate_edits(&mut document.code_index, &byte_edits);
         let mut previous_line_starts = temp.vec(document.buffer.line_starts.len());
         buffer_replace_ranges(
             &mut document.buffer,
@@ -1472,7 +1472,6 @@ pub fn document_redo(document: &mut Document) {
     let Some(transaction) = document.redo.pop() else {
         return;
     };
-    code_index_invalidate(&mut document.code_index);
     git_gutter_invalidate(&mut document.git_gutter);
     for edit in &transaction.edits {
         let temp = idno_std::mem().scratch().temp();
@@ -1491,6 +1490,7 @@ pub fn document_redo(document: &mut Document) {
             ));
         }
         syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
+        code_index_invalidate_edits(&mut document.code_index, &byte_edits);
         let mut previous_line_starts = temp.vec(document.buffer.line_starts.len());
         buffer_replace_ranges(
             &mut document.buffer,
@@ -1573,7 +1573,7 @@ pub fn document_replace_ranges(
         line_edits.push((start_line, end_line, inserted_lines));
     }
     syntax_highlighting_invalidate_edits(&mut document.syntax, &byte_edits);
-    code_index_invalidate(&mut document.code_index);
+    code_index_invalidate_edits(&mut document.code_index, &byte_edits);
     git_gutter_invalidate(&mut document.git_gutter);
     git_gutter_adjust_edits(&mut document.git_gutter, &line_edits);
     let mut before = Vec::with_capacity(document.secondary_selections.len() + 1);
