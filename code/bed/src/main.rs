@@ -3,6 +3,7 @@
 
 mod buffer;
 mod code_index;
+mod diagnostics;
 mod editor;
 mod fuzzy;
 mod git;

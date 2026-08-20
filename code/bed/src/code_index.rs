@@ -6,6 +6,7 @@ pub enum CodeSymbolKind {
     Function,
     Type,
     Module,
+    Constant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,11 +311,12 @@ fn code_definition_keyword(buffer: &GapBuffer, start: usize, end: usize) -> Opti
         Some(CodeSymbolKind::Type)
     } else if code_range_equal(buffer, start, end, b"mod") {
         Some(CodeSymbolKind::Module)
-    } else if code_range_equal(buffer, start, end, b"let")
-        || code_range_equal(buffer, start, end, b"const")
+    } else if code_range_equal(buffer, start, end, b"let") {
+        Some(CodeSymbolKind::Value)
+    } else if code_range_equal(buffer, start, end, b"const")
         || code_range_equal(buffer, start, end, b"static")
     {
-        Some(CodeSymbolKind::Value)
+        Some(CodeSymbolKind::Constant)
     } else {
         None
     }
@@ -440,7 +442,7 @@ mod tests {
         let identifier = code_index_identifier_at(&index, use_position).unwrap();
         let definition = code_index_definition_for(&buffer, &index, identifier).unwrap();
         let symbol = index.symbols[definition];
-        assert_eq!(symbol.kind, CodeSymbolKind::Value);
+        assert_eq!(symbol.kind, CodeSymbolKind::Constant);
         assert_eq!(index.identifiers[symbol.identifier as usize].start, 35);
     }
 }

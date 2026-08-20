@@ -690,6 +690,6 @@ mod tests {
         let buffer = buffer_from_bytes(b"let value: Option<usize>; value.get_or_insert()");
         let method = rust_method_definition(&buffer, 34, &corpus).unwrap();
         assert_eq!(rust_method_name(&corpus, method), "get_or_insert");
-        assert_eq!(corpus.methods[method].position, 63);
+        assert_eq!(corpus.methods[method].position, 64);
     }
 }

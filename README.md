@@ -15,11 +15,11 @@ Current bindings:
 | normal | `h/j/k/l`, Helix-category `w/b`, or arrows move selections; `x` selects/extends whole lines; `d` deletes; `y` yanks and `p`/`P` paste after/before; `i/a/I/A/o` enter insert; `v` extends selections; `[Space`/`]Space` insert a blank line without moving |
 | select | movement extends the selection, `d` deletes it, `v` or Escape returns to normal |
 | insert | text inserts, Backspace/Delete edit, arrows move, Escape returns to normal |
-| objects | `ma<char>` selects around a matching pair; `mi<char>` selects inside it; both remain normal-mode motions |
+| objects | `ma<char>` selects around a matching pair; `mi<char>` selects inside it; `maf`/`mif` select the outermost enclosing function; all remain normal-mode motions |
 | multiple cursors | `C` adds a cursor on the line below; movement and editing affect every selection |
 | search | `/` performs contiguous smart-case search in the current buffer from the cursor forward with wraparound; `s` searches within the current selections and previews one cursor per occurrence; `n`/`N` traverse a committed `/` search |
-| code navigation | in Rust buffers, `gd` jumps to the nearest lexically visible definition and `gr` selects references resolving to it; `[g`/`]g` visit previous/next Git changes |
-| pickers | `Space f` searches project files; `Space /` fuzzy-searches project contents and accepts a whole-line selection; `Space s`/`Space S` search and select document/workspace symbols; `:` opens the command palette |
+| code navigation | in Rust buffers, `gd` selects the nearest definition and `gr` opens a reference picker; `[f`/`]f` select functions, `[g`/`]g` visit Git changes, and `[d`/`]d` visit diagnostics |
+| pickers | `Space f` searches project files; `Space /` searches contents; `Space s`/`Space S` search symbols; `Space d`/`Space D` show document/workspace diagnostics; `:` opens the command palette |
 | history | `u`/`U` undo/redo; Ctrl-O/Tab move backward/forward through jumps |
 | any | Ctrl-S saves, Ctrl-Q discards changes and quits |
 
@@ -37,7 +37,8 @@ names; file-taking commands such as `:write `, `:w `, `:open `, and `:o `
 complete project-relative paths with Tab while Enter keeps the typed path
 verbatim. Buffer commands include `:new`/`:n`, `:bc[!]`, `:bco[!]`,
 `:bca[!]`, `:bn`, and `:bp`. The write/quit families include `:wa[!]`,
-`:qa[!]`, and `:wqa[!]`.
+`:qa[!]`, and `:wqa[!]`. `:rl[!]` reloads the current buffer and
+`:rla[!]` reloads every file-backed buffer through undoable replacements.
 
 Kanagawa is the default theme. `:theme <name>` selects `kanagawa`, `bogster`,
 `everforest_light`, `noctis`, or `kaolin-valley-dark`. The same set is on
@@ -54,15 +55,16 @@ span storage: opening a file gets a one-millisecond immediate pass, then any
 remaining work continues in 500-microsecond event-loop slices. Edits clear and
 reuse the span allocation. No parser task, syntax tree, or tree-sitter runtime
 sits between input and rendering. Themes distinguish comments, structured
-comment annotations (`NOTE(Erik):`, `FIXME:`, `HACK:`, and other uppercase
-labels), ordinary/control/declaration keywords, strings, numbers, types,
+comment annotations (`NOTE`/`HELP` in blue, `WARNING`/`HACK` in orange,
+`FIXME`/`ERROR` in emphatic red, and other uppercase labels), Rust lifetimes,
+ordinary/control/declaration keywords, strings, numbers, types,
 functions, constants, attributes, operators, punctuation, and markup.
 
 Rust buffers also maintain a resumable flat identifier/definition index. It
 ignores comments and strings, prefers the nearest definition visible at the
 identifier's lexical scope, and deliberately accepts incomplete source. This
-also backs document symbol lookup. Workspace symbol lookup uses the retained
-project content corpus. Explicit local types support member completion: for
+also backs document symbol lookup. Workspace symbol lookup includes top-level
+workspace and active-toolchain standard-library symbols. Explicit local types support member completion: for
 example `potato: Vec<usize>` resolves `potato.pu` against a compact method index
 built from workspace Rust sources and the active toolchain's installed
 standard-library sources. Toolchain/sysroot discovery and source reads run on
@@ -70,10 +72,17 @@ the shared worker pool; typing only performs local inference and ranks retained
 method spans. Tab accepts a completion and Ctrl-N/Ctrl-P changes the selected
 candidate. This remains intentionally tolerant inference rather than a compiler
 front end.
-`gd` also resolves `mod name;` to `name.rs` or `name/mod.rs`, and falls back to
-the retained workspace symbol corpus for top-level definitions in other Rust
-files. Symbol picker acceptance selects the identifier with its cursor at the
-start instead of merely jumping to its line.
+`gd` resolves constants, statics, `mod name;` files, top-level workspace
+symbols, standard-library types, and methods on explicitly typed receivers.
+Definitions and picker results select the identifier with the cursor at its
+start. Cross-file navigation records only the origin and final selection, so
+Ctrl-O returns directly to the call site. `gr` shows exact retained workspace
+occurrences in a picker rather than turning them into editing cursors.
+
+Cargo diagnostics are collected on the worker pool and published as one
+severity-sorted retained snapshot. `Space d`/`Space D` show file/workspace
+diagnostic pickers and `[d`/`]d` navigate them with errors before warnings and
+informational messages. Saving requests a refresh without blocking input.
 
 Opening a directory starts the file picker. File discovery loads exactly one
 authoritative ignore file, choosing the first existing file in this order:
@@ -105,8 +114,10 @@ behaviors.
 Collapsed cursors remain collapsed through `i` and `o`; only a genuinely
 extended pre-existing selection expands or retracts with insert edits. Deleting
 an untouched auto-inserted opener with Backspace also deletes its paired closer.
-`:reload` discards the current buffer contents, rereads the file from disk, and
-records the replacement as an undoable transaction.
+Within leading space indentation, Backspace removes a full configured unit only
+on exact unit boundaries; partial indentation deletes one space.
+`:reload`/`:rl` and `:reload-all`/`:rla` reread from disk through undoable
+replacements.
 
 Git gutter baselines are fetched off the input thread and current-buffer line
 hashing/diffing proceeds in bounded event-loop slices. Additions and changes use
@@ -119,6 +130,9 @@ rebuilt, remapped immediately across edits, and atomically replaced when the
 bounded rebuild completes. Normal document rendering hashes logical rows and
 transmits only changed rows plus the status line, so cursor movement no longer
 rewrites the entire viewport.
+Touched Git lines keep a provisional modified marker until the completed diff
+proves they match the baseline again. Vertical motion retains its preferred
+column across short lines and restores it on longer lines.
 
 The current core deliberately has no platform abstraction, LSP, tree-sitter,
 terminal framework, or rope. Future editing operations should continue to work

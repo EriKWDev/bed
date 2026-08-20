@@ -240,6 +240,7 @@ pub fn git_gutter_adjust_edits(gutter: &mut GitGutter, edits: &[(usize, usize, u
         let start_line = (original_start_line as isize + shift) as usize;
         let end_line = (original_end_line as isize + shift) as usize;
         let delta = inserted_lines as isize - (original_end_line - original_start_line) as isize;
+        let mut retained_flags = 0;
         markers.retain_mut(|marker| {
             let line = marker.line as usize;
             if line < start_line {
@@ -248,9 +249,30 @@ pub fn git_gutter_adjust_edits(gutter: &mut GitGutter, edits: &[(usize, usize, u
                 marker.line = (line as isize + delta) as u32;
                 true
             } else {
+                retained_flags |= marker.flags;
                 false
             }
         });
+        let provisional_flags = if retained_flags & GIT_LINE_ADDED != 0 {
+            GIT_LINE_ADDED
+        } else {
+            retained_flags | GIT_LINE_MODIFIED
+        };
+        let position = markers.partition_point(|marker| marker.line < start_line as u32);
+        if markers
+            .get(position)
+            .is_some_and(|marker| marker.line == start_line as u32)
+        {
+            markers[position].flags |= provisional_flags;
+        } else {
+            markers.insert(
+                position,
+                GitGutterLine {
+                    line: start_line as u32,
+                    flags: provisional_flags,
+                },
+            );
+        }
         shift += delta;
     }
 }
@@ -596,5 +618,16 @@ mod tests {
         assert!(git_gutter_line_modified(git_gutter_flags(&gutter, 3)));
         assert!(gutter.markers.is_empty());
         assert_eq!(gutter.previous_markers.len(), 1);
+        git_gutter_adjust_edits(&mut gutter, &[(3, 3, 0)]);
+        assert!(git_gutter_line_modified(git_gutter_flags(&gutter, 3)));
+    }
+
+    #[test]
+    fn editing_a_clean_line_publishes_a_provisional_modified_marker() {
+        let mut gutter = git_gutter_empty();
+        gutter.phase = GitGutterPhase::Complete;
+        git_gutter_invalidate(&mut gutter);
+        git_gutter_adjust_edits(&mut gutter, &[(2, 2, 0)]);
+        assert!(git_gutter_line_modified(git_gutter_flags(&gutter, 2)));
     }
 }

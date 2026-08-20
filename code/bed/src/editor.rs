@@ -8,6 +8,9 @@ use crate::code_index::{
     CodeIndex, code_index_definition_for, code_index_empty, code_index_identifier_at,
     code_index_invalidate, code_index_set_path, code_index_step,
 };
+use crate::diagnostics::{
+    Diagnostics, diagnostics_pending, diagnostics_poll, diagnostics_restart, diagnostics_start,
+};
 use crate::fuzzy::{FuzzyMatch, fuzzy_byte_matches, fuzzy_rank};
 use crate::git::{
     GitGutter, git_gutter_adjust_edits, git_gutter_empty, git_gutter_flags, git_gutter_invalidate,
@@ -95,6 +98,8 @@ pub enum PickerKind {
     DocumentSymbols,
     WorkspaceSymbols,
     References,
+    DocumentDiagnostics,
+    WorkspaceDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +141,14 @@ const SPACE_KEY_HINTS: &[KeyHint] = &[
     KeyHint {
         key: "S",
         description: "workspace symbols",
+    },
+    KeyHint {
+        key: "d",
+        description: "document diagnostics",
+    },
+    KeyHint {
+        key: "D",
+        description: "workspace diagnostics",
     },
     KeyHint {
         key: "Y",
@@ -245,6 +258,10 @@ const INSERT_LINE_KEY_HINTS: &[KeyHint] = &[
         key: "f",
         description: "function",
     },
+    KeyHint {
+        key: "d",
+        description: "diagnostic",
+    },
 ];
 
 pub fn pending_key_hints(pending: PendingKey) -> &'static [KeyHint] {
@@ -306,6 +323,7 @@ pub struct Picker {
     pub symbol_candidates: Vec<usize>,
     pub rust_symbol_candidates: Vec<usize>,
     pub reference_targets: Vec<ReferenceTarget>,
+    pub diagnostic_candidates: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -389,6 +407,7 @@ pub struct Editor {
     pub register: Register,
     pub clipboard_copy_task: Option<idno_std::micropool::OwnedTask<bool>>,
     pub clipboard_paste_task: Option<idno_std::micropool::OwnedTask<ClipboardPaste>>,
+    pub diagnostics: Diagnostics,
 }
 
 const COMMANDS: [&str; 66] = [
@@ -689,6 +708,7 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
     } else {
         rust_method_index_start(&project.root, std::sync::Arc::clone(&project.paths))
     };
+    let diagnostics = diagnostics_start(&project.root);
     let ignore_status = project
         .ignore_file
         .as_ref()
@@ -759,6 +779,7 @@ pub fn editor_open(path: Option<std::path::PathBuf>) -> std::io::Result<Editor> 
         },
         clipboard_copy_task: None,
         clipboard_paste_task: None,
+        diagnostics,
     };
     if open_picker {
         editor_open_picker(&mut editor, PickerKind::Files);
@@ -835,7 +856,8 @@ pub fn editor_run(editor: &mut Editor, terminal: &mut Terminal) -> std::io::Resu
             | editor_step_code_index(editor)
             | editor_step_git_gutter(editor)
             | editor_poll_rust_methods(editor)
-            | editor_poll_clipboard(editor);
+            | editor_poll_clipboard(editor)
+            | diagnostics_poll(&mut editor.diagnostics);
         if input_changed || background_changed {
             match editor_render(editor, terminal) {
                 Ok(()) => {}
@@ -901,6 +923,12 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             }
             (PendingKey::Space, Key::Character('S')) => {
                 editor_open_picker(editor, PickerKind::WorkspaceSymbols)
+            }
+            (PendingKey::Space, Key::Character('d')) => {
+                editor_open_picker(editor, PickerKind::DocumentDiagnostics)
+            }
+            (PendingKey::Space, Key::Character('D')) => {
+                editor_open_picker(editor, PickerKind::WorkspaceDiagnostics)
             }
             (PendingKey::Space, Key::Character('Y')) => editor_yank_system(editor),
             (PendingKey::Space, Key::Character('P')) => editor_paste_system(editor),
@@ -976,6 +1004,12 @@ pub fn editor_handle_key(editor: &mut Editor, key: Key) -> bool {
             (PendingKey::InsertLineBelow, Key::Character('f')) => {
                 editor_goto_function(editor, true)
             }
+            (PendingKey::InsertLineAbove, Key::Character('d')) => {
+                editor_next_diagnostic(editor, false)
+            }
+            (PendingKey::InsertLineBelow, Key::Character('d')) => {
+                editor_next_diagnostic(editor, true)
+            }
             _ => {}
         }
         return false;
@@ -1027,6 +1061,7 @@ pub fn editor_save(editor: &mut Editor) {
     editor.status.clear();
     if document_write(&mut editor.documents[current], &mut editor.status) {
         editor.quit_warning = false;
+        diagnostics_restart(&mut editor.diagnostics);
     }
 }
 
@@ -1073,6 +1108,7 @@ fn editor_save_all(editor: &mut Editor) -> bool {
     editor.status.clear();
     write!(&mut editor.status, "wrote {written} buffer(s)").unwrap();
     editor.quit_warning = false;
+    diagnostics_restart(&mut editor.diagnostics);
     true
 }
 
@@ -1392,6 +1428,7 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         symbol_candidates: Vec::new(),
         rust_symbol_candidates: Vec::new(),
         reference_targets: Vec::new(),
+        diagnostic_candidates: Vec::new(),
     };
     if kind == PickerKind::DocumentSymbols {
         search_corpus_index_document(editor_document(editor), &mut picker.symbol_corpus);
@@ -1406,6 +1443,31 @@ pub fn editor_open_picker(editor: &mut Editor, kind: PickerKind) {
         picker
             .rust_symbol_candidates
             .extend(0..editor.rust_methods.corpus.symbols.len());
+    } else if matches!(
+        kind,
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics
+    ) {
+        if diagnostics_pending(&editor.diagnostics) && editor.diagnostics.published.is_empty() {
+            editor
+                .status
+                .push_str("compiler diagnostics are still loading");
+            return;
+        }
+        let current_path = editor_document(editor)
+            .path
+            .as_ref()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
+        for (diagnostic, item) in editor.diagnostics.published.iter().zip(0..) {
+            if kind == PickerKind::WorkspaceDiagnostics
+                || current_path.as_ref().is_some_and(|path| {
+                    std::fs::canonicalize(&diagnostic.path)
+                        .unwrap_or_else(|_| diagnostic.path.clone())
+                        == *path
+                })
+            {
+                picker.diagnostic_candidates.push(item);
+            }
+        }
     }
     picker_refresh(editor, &mut picker);
     editor.picker = Some(picker);
@@ -1487,6 +1549,30 @@ pub fn picker_refresh(editor: &Editor, picker: &mut Picker) {
                     );
                 }
                 fuzzy_rank(&picker.query, &labels, &mut picker.matches);
+            }
+        }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            if picker.query.is_empty() {
+                picker.matches.clear();
+                picker.matches.extend(
+                    (0..picker.diagnostic_candidates.len())
+                        .map(|item| FuzzyMatch { item, score: 0 }),
+                );
+            } else {
+                let temp = idno_std::mem().scratch().temp();
+                let mut labels = temp.vec(picker.diagnostic_candidates.len());
+                for &diagnostic in &picker.diagnostic_candidates {
+                    labels.push(editor.diagnostics.published[diagnostic].display.as_str());
+                }
+                fuzzy_rank(&picker.query, &labels, &mut picker.matches);
+                picker.matches.sort_unstable_by(|left, right| {
+                    let left_diagnostic = picker.diagnostic_candidates[left.item];
+                    let right_diagnostic = picker.diagnostic_candidates[right.item];
+                    editor.diagnostics.published[left_diagnostic]
+                        .severity
+                        .cmp(&editor.diagnostics.published[right_diagnostic].severity)
+                        .then_with(|| right.score.cmp(&left.score))
+                });
             }
         }
     }
@@ -1638,6 +1724,12 @@ fn editor_accept_picker(editor: &mut Editor) {
                 );
             }
         }
+        PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+            let Some(&diagnostic) = picker.diagnostic_candidates.get(item) else {
+                return;
+            };
+            editor_goto_diagnostic(editor, diagnostic);
+        }
     }
 }
 
@@ -1686,7 +1778,9 @@ fn picker_complete(editor: &Editor, picker: &mut Picker) {
         | PickerKind::SearchProject
         | PickerKind::DocumentSymbols
         | PickerKind::WorkspaceSymbols
-        | PickerKind::References => {}
+        | PickerKind::References
+        | PickerKind::DocumentDiagnostics
+        | PickerKind::WorkspaceDiagnostics => {}
         PickerKind::Commands => {
             if command_theme_argument(&picker.query).is_some() {
                 let command_end = picker
@@ -1983,6 +2077,7 @@ fn editor_background_work_pending(editor: &Editor) -> bool {
         || rust_method_index_pending(&editor.rust_methods)
         || editor.clipboard_copy_task.is_some()
         || editor.clipboard_paste_task.is_some()
+        || diagnostics_pending(&editor.diagnostics)
         || editor.picker.as_ref().is_some_and(|picker| {
             picker.kind == PickerKind::SearchProject && !picker.search_complete
         })
@@ -2714,7 +2809,9 @@ pub fn editor_execute_command(editor: &mut Editor, input: &str) {
             }
             editor.status.push_str("project files reloaded");
         }
-        "reload" | "reload!" | "rl" | "rl!" => editor_reload_document(editor),
+        "reload" | "reload!" | "rl" | "rl!" => {
+            editor_reload_document(editor);
+        }
         "reload-all" | "reload-all!" | "rla" | "rla!" => editor_reload_all_documents(editor),
         "toggle-auto-indentation" => {
             let enabled = !editor.config.flags.contains(EditorFlags::AUTO_INDENTATION);
@@ -2741,20 +2838,20 @@ pub fn editor_execute_command(editor: &mut Editor, input: &str) {
     }
 }
 
-fn editor_reload_document(editor: &mut Editor) {
+fn editor_reload_document(editor: &mut Editor) -> bool {
     profiling::function_scope!();
     document_commit_transaction(editor_document_mut(editor));
     let Some(path) = editor_document(editor).path.as_deref() else {
         editor
             .status
             .push_str("scratch buffer has no file to reload");
-        return;
+        return false;
     };
     let source = match std::fs::read(path) {
         Ok(source) => source,
         Err(error) => {
             write!(&mut editor.status, "reload failed: {error}").unwrap();
-            return;
+            return false;
         }
     };
     let unchanged = {
@@ -2768,7 +2865,7 @@ fn editor_reload_document(editor: &mut Editor) {
     if unchanged {
         editor_document_mut(editor).modified = false;
         editor.status.push_str("buffer already matches disk");
-        return;
+        return true;
     }
     let document = editor_document_mut(editor);
     let temp = idno_std::mem().scratch().temp();
@@ -2795,6 +2892,7 @@ fn editor_reload_document(editor: &mut Editor) {
     document_replace_ranges(document, &mut replacements, &source, Some(&after));
     document.modified = false;
     write!(&mut editor.status, "reloaded {} bytes", source.len()).unwrap();
+    true
 }
 
 fn editor_reload_all_documents(editor: &mut Editor) {
@@ -2806,8 +2904,7 @@ fn editor_reload_all_documents(editor: &mut Editor) {
             continue;
         }
         editor.current = document;
-        editor_reload_document(editor);
-        reloaded += usize::from(!editor.documents[document].modified);
+        reloaded += usize::from(editor_reload_document(editor));
     }
     editor.current = current.min(editor.documents.len().saturating_sub(1));
     editor.status.clear();
@@ -3759,6 +3856,7 @@ fn editor_select_word_motion(editor: &mut Editor, forward: bool) {
         }
     }
     document_set_selections(document, &selections);
+    document.preferred_column = buffer_line_and_column(&document.buffer, document.cursor).1;
 }
 
 fn editor_add_cursor_below(editor: &mut Editor) {
@@ -4125,9 +4223,15 @@ fn editor_select_enclosing_function(editor: &mut Editor, inside: bool) {
         return;
     };
     let (start, end) = if inside {
-        (buffer_next_char(&document.buffer, target.open), target.close)
+        (
+            buffer_next_char(&document.buffer, target.open),
+            target.close,
+        )
     } else {
-        (target.start, buffer_next_char(&document.buffer, target.close))
+        (
+            target.start,
+            buffer_next_char(&document.buffer, target.close),
+        )
     };
     editor_set_symbol_selection(editor, start, end);
 }
@@ -4234,7 +4338,24 @@ fn rust_matching_body_brace(buffer: &GapBuffer, open: usize) -> Option<usize> {
         } else if byte == b'/' && next == Some(b'*') {
             block_depth = 1;
             position += 1;
-        } else if matches!(byte, b'\'' | b'"') {
+        } else if byte == b'\'' {
+            let mut lifetime_end = position + 1;
+            if lifetime_end < length && rust_identifier_byte(buffer_byte(buffer, lifetime_end)) {
+                lifetime_end += 1;
+                while lifetime_end < length
+                    && rust_identifier_byte(buffer_byte(buffer, lifetime_end))
+                {
+                    lifetime_end += 1;
+                }
+            }
+            if lifetime_end > position + 1
+                && (lifetime_end >= length || buffer_byte(buffer, lifetime_end) != b'\'')
+            {
+                position = lifetime_end;
+                continue;
+            }
+            string = byte;
+        } else if byte == b'"' {
             string = byte;
         } else if byte == b'{' {
             depth += 1;
@@ -4337,10 +4458,7 @@ fn editor_move_horizontal(editor: &mut Editor, forward: bool) {
 fn editor_move_vertical(editor: &mut Editor, down: bool) {
     let mode = editor.mode;
     let document = editor_document_mut(editor);
-    let (line, column) = buffer_line_and_column(&document.buffer, document.cursor);
-    if document.preferred_column == 0 || column != 0 {
-        document.preferred_column = column;
-    }
+    let line = buffer_line_and_column(&document.buffer, document.cursor).0;
     let primary_line = line;
     let temp = idno_std::mem().scratch().temp();
     let mut selections = temp.vec(document.secondary_selections.len() + 1);
@@ -4362,6 +4480,11 @@ fn editor_move_vertical(editor: &mut Editor, down: bool) {
                 selection_column
             },
         );
+        let target_start = buffer_line_start(&document.buffer, selection.cursor);
+        let target_end = buffer_line_end(&document.buffer, selection.cursor);
+        if mode != Mode::Insert && selection.cursor == target_end && target_end > target_start {
+            selection.cursor = buffer_previous_char(&document.buffer, target_end);
+        }
         selection.cursor = command_cursor_clamped(&document.buffer, selection.cursor, mode);
         if mode == Mode::Normal {
             selection.anchor = selection.cursor;
@@ -4395,6 +4518,73 @@ fn editor_goto_git_change(editor: &mut Editor, forward: bool) {
     editor_goto_line(editor, target);
 }
 
+fn editor_next_diagnostic(editor: &mut Editor, forward: bool) {
+    profiling::function_scope!();
+    if editor.diagnostics.published.is_empty() {
+        editor
+            .status
+            .push_str(if diagnostics_pending(&editor.diagnostics) {
+                "compiler diagnostics are still loading"
+            } else {
+                "no diagnostics"
+            });
+        return;
+    }
+    let Some(path) = editor_document(editor).path.as_ref() else {
+        editor.status.push_str("buffer has no diagnostics");
+        return;
+    };
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    let temp = idno_std::mem().scratch().temp();
+    let mut candidates = temp.vec(32);
+    for (index, diagnostic) in editor.diagnostics.published.iter().enumerate() {
+        let diagnostic_path =
+            std::fs::canonicalize(&diagnostic.path).unwrap_or_else(|_| diagnostic.path.clone());
+        if diagnostic_path == path {
+            candidates.push(index);
+        }
+    }
+    if candidates.is_empty() {
+        editor.status.push_str("buffer has no diagnostics");
+        return;
+    }
+    let document = editor_document(editor);
+    let current = candidates.iter().position(|&index| {
+        let diagnostic = &editor.diagnostics.published[index];
+        buffer_position_at_line_column(
+            &document.buffer,
+            diagnostic.line as usize,
+            diagnostic.column as usize,
+        ) == document.cursor
+    });
+    let target = match current {
+        Some(current) if forward => candidates[(current + 1) % candidates.len()],
+        Some(current) => candidates[current.checked_sub(1).unwrap_or(candidates.len() - 1)],
+        None => candidates[0],
+    };
+    editor_goto_diagnostic(editor, target);
+}
+
+fn editor_goto_diagnostic(editor: &mut Editor, diagnostic: usize) {
+    profiling::function_scope!();
+    let Some(diagnostic) = editor.diagnostics.published.get(diagnostic) else {
+        return;
+    };
+    let path = diagnostic.path.clone();
+    let line = diagnostic.line as usize;
+    let column = diagnostic.column as usize;
+    let before = editor_location(editor);
+    let Some(target) = editor_document_target(editor, path) else {
+        return;
+    };
+    editor_switch_document_state(editor, target);
+    let start = buffer_position_at_line_column(&editor_document(editor).buffer, line, column);
+    let end = buffer_next_char(&editor_document(editor).buffer, start);
+    editor_set_symbol_selection(editor, start, end);
+    let after = editor_location(editor);
+    editor_record_jump(editor, before, after);
+}
+
 fn editor_goto_definition(editor: &mut Editor) {
     profiling::function_scope!();
     let temp = idno_std::mem().scratch().temp();
@@ -4407,16 +4597,17 @@ fn editor_goto_definition(editor: &mut Editor) {
             256 * 1024,
             std::time::Duration::from_micros(500),
         );
-        let Some(identifier) = code_index_identifier_at(&document.code_index, document.cursor)
+        let Some(identifier_index) =
+            code_index_identifier_at(&document.code_index, document.cursor)
         else {
             editor.status.push_str("no indexed identifier");
             return;
         };
-        let identifier_range = document.code_index.identifiers[identifier];
+        let identifier_range = document.code_index.identifiers[identifier_index];
         for position in identifier_range.start as usize..identifier_range.end as usize {
             name.push(buffer_byte(&document.buffer, position));
         }
-        code_index_definition_for(&document.buffer, &document.code_index, identifier).map(
+        code_index_definition_for(&document.buffer, &document.code_index, identifier_index).map(
             |symbol| {
                 let symbol = document.code_index.symbols[symbol];
                 let identifier = document.code_index.identifiers[symbol.identifier as usize];
@@ -4558,6 +4749,7 @@ fn editor_select_references(editor: &mut Editor) {
     profiling::function_scope!();
     let temp = idno_std::mem().scratch().temp();
     let mut name = temp.vec(64);
+    let mut workspace = true;
     {
         let document = editor_document_mut(editor);
         code_index_step(
@@ -4566,19 +4758,26 @@ fn editor_select_references(editor: &mut Editor) {
             256 * 1024,
             std::time::Duration::from_micros(500),
         );
-        let Some(identifier) = code_index_identifier_at(&document.code_index, document.cursor)
+        let Some(identifier_index) =
+            code_index_identifier_at(&document.code_index, document.cursor)
         else {
             editor.status.push_str("no indexed identifier");
             return;
         };
-        let identifier = document.code_index.identifiers[identifier];
+        let identifier = document.code_index.identifiers[identifier_index];
+        if let Some(definition) =
+            code_index_definition_for(&document.buffer, &document.code_index, identifier_index)
+        {
+            workspace = document.code_index.symbols[definition].kind
+                != crate::code_index::CodeSymbolKind::Value;
+        }
         for position in identifier.start as usize..identifier.end as usize {
             name.push(buffer_byte(&document.buffer, position));
         }
     }
     editor_open_picker(editor, PickerKind::References);
     let mut picker = editor.picker.take().unwrap();
-    reference_targets_collect(editor, &name, &mut picker);
+    reference_targets_collect(editor, &name, workspace, &mut picker);
     if picker.reference_targets.is_empty() {
         editor.status.push_str("no references indexed");
         return;
@@ -4587,7 +4786,7 @@ fn editor_select_references(editor: &mut Editor) {
     editor.picker = Some(picker);
 }
 
-fn reference_targets_collect(editor: &Editor, name: &[u8], picker: &mut Picker) {
+fn reference_targets_collect(editor: &Editor, name: &[u8], workspace: bool, picker: &mut Picker) {
     profiling::function_scope!();
     let document = editor_document(editor);
     let current_project_file = document.path.as_ref().and_then(|path| {
@@ -4627,6 +4826,9 @@ fn reference_targets_collect(editor: &Editor, name: &[u8], picker: &mut Picker) 
         }
         line_start = line_end + 1;
         line_number += 1;
+    }
+    if !workspace {
+        return;
     }
     let Some(corpus) = editor.project_search.as_ref() else {
         return;
@@ -5367,6 +5569,8 @@ fn editor_render_picker(
         PickerKind::DocumentSymbols => "document symbols",
         PickerKind::WorkspaceSymbols => "workspace symbols",
         PickerKind::References => "references",
+        PickerKind::DocumentDiagnostics => "document diagnostics",
+        PickerKind::WorkspaceDiagnostics => "workspace diagnostics",
     };
     editor.frame.clear();
     editor
@@ -5471,6 +5675,10 @@ fn editor_render_picker(
                             [line.display_start as usize..line.display_end as usize],
                     )
                     .unwrap_or("")
+                }
+                PickerKind::DocumentDiagnostics | PickerKind::WorkspaceDiagnostics => {
+                    let diagnostic = picker.diagnostic_candidates[item];
+                    editor.diagnostics.published[diagnostic].display.as_str()
                 }
             };
             let mut end = label.len().min(width.saturating_sub(2));
@@ -5671,6 +5879,9 @@ mod tests {
             ),
             (7, 10)
         );
+        editor_handle_key(&mut editor, Key::Control(15));
+        assert_eq!(editor.current, 0);
+        assert_eq!(editor_document(&editor).cursor, 24);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -6062,7 +6273,17 @@ mod tests {
         for key in ['g', 'r'] {
             editor_handle_key(&mut editor, Key::Character(key));
         }
-        assert_eq!(editor_document(&editor).secondary_selections.len(), 2);
+        assert_eq!(
+            editor.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::References)
+        );
+        assert_eq!(
+            editor
+                .picker
+                .as_ref()
+                .map(|picker| picker.reference_targets.len()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -6083,6 +6304,9 @@ mod tests {
                 owner_end: 3,
                 name_start: 3,
                 name_end: 7,
+                path: 0,
+                position: 0,
+                end: 0,
             });
         let end = buffer_len(&editor.documents[0].buffer);
         editor.documents[0].cursor = end;
@@ -6363,5 +6587,68 @@ mod tests {
             (7, 23)
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn vertical_motion_preserves_the_preferred_column_across_short_lines() {
+        let mut editor = editor_with_text("abcdef\nx\nabcdef");
+        for _ in 0..5 {
+            editor_handle_key(&mut editor, Key::Character('l'));
+        }
+        assert_eq!(
+            buffer_line_and_column(
+                &editor_document(&editor).buffer,
+                editor_document(&editor).cursor
+            ),
+            (0, 5)
+        );
+        editor_handle_key(&mut editor, Key::Character('j'));
+        assert_eq!(
+            buffer_line_and_column(
+                &editor_document(&editor).buffer,
+                editor_document(&editor).cursor
+            ),
+            (1, 0)
+        );
+        editor_handle_key(&mut editor, Key::Character('j'));
+        assert_eq!(
+            buffer_line_and_column(
+                &editor_document(&editor).buffer,
+                editor_document(&editor).cursor
+            ),
+            (2, 5)
+        );
+    }
+
+    #[test]
+    fn function_objects_choose_outermost_scope_and_navigation_includes_nested_functions() {
+        let source = "pub fn outer() {\n    fn inner() {}\n    inner();\n}\nfn next() {}\n";
+        let mut editor = editor_with_text(source);
+        editor.documents[0].path = Some(std::path::PathBuf::from("main.rs"));
+        code_index_set_path(
+            &mut editor.documents[0].code_index,
+            Some(std::path::Path::new("main.rs")),
+        );
+        editor.documents[0].cursor = source.find("inner();").unwrap();
+        editor.documents[0].anchor = editor.documents[0].cursor;
+        for key in ['m', 'a', 'f'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(editor_document(&editor).cursor, 0);
+        assert_eq!(
+            editor_document(&editor).anchor,
+            source.find("\n}\n").unwrap() + 1
+        );
+
+        editor.documents[0].cursor = 0;
+        editor.documents[0].anchor = 0;
+        for key in [']', 'f'] {
+            editor_handle_key(&mut editor, Key::Character(key));
+        }
+        assert_eq!(
+            editor_document(&editor).cursor,
+            source.find("fn inner").unwrap()
+        );
+        assert_eq!(editor.mode, Mode::Normal);
     }
 }

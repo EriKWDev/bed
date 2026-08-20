@@ -40,8 +40,8 @@ exhaustive inventories.
   `[g`/`]g`, backed by a nonblocking minimal Git gutter.
 - Extension-selected resumable syntax highlighting for TOML, Markdown, Rust,
   C, C++, Go, Nim, and Odin, including structured comment annotations and
-  separate control/declaration/constant/operator classes; local Rust `gd`
-  definition lookup and `gr` reference selection over the
+  severity colors, Rust lifetimes, and separate control/declaration/constant/operator classes; local Rust `gd`
+  definition lookup and a `gr` reference picker over the
   incomplete-source-tolerant flat symbol index.
 - Document/workspace symbol palettes on `Space s`/`Space S` and explicit-type
   Rust member completion using an asynchronously built compact method index for
@@ -51,13 +51,18 @@ exhaustive inventories.
 - Helix-style word/punctuation/whitespace boundaries for `w` and `b`, module
   file and workspace-symbol definition fallback, whole-line global-search
   acceptance, and identifier-selecting symbol palette acceptance.
+- Preferred-column vertical motion; function objects on `maf`/`mif`; nested
+  function traversal on `[f`/`]f`; standard-library symbol/method definitions;
+  atomic cross-file jumps; and undoable `:rl`/`:rla` reload aliases.
+- Nonblocking Cargo diagnostics with severity-ordered document/workspace
+  pickers on `Space d`/`Space D` and navigation on `[d`/`]d`.
 
 ## Next audit groups
 
 - Remaining tutor editing operators: find/till, replace, yank/paste, join,
   indent/unindent, case changes, comments, selection splitting, and alignment.
-- Registers, macros, repeat-last-motion/change, count prefixes, diagnostics,
-  symbol/code-action commands, and clipboard integration.
+- Registers, macros, repeat-last-motion/change, remaining count prefixes,
+  richer code actions, and semantic inference beyond explicit local types.
 - View prefix behavior, buffer/jump pickers, split/window commands, and picker
   history.
 - Search parity for reverse search and fuzzy occurrence splitting beyond exact
